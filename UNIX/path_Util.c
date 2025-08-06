@@ -1,5 +1,5 @@
 
-// This is under still under progress
+// This section is still under progress
 
 static void __init do_ctors(void)
 {
@@ -196,3 +196,5 @@ static inline void do_trace_initcall_level(const char *level)
 	trace_initcall_level_cb(NULL, level);
 }
 #endif /* !TRACEPOINTS_ENABLED */
+
+/* Soon */

@@ -1,5 +1,20 @@
+#include <linux/fcntl.h>
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/init_syscalls.h>
+#include <linux/init.h>
+#include <linux/async.h>
+#include <linux/export.h>
+#include <linux/slab.h>
+#include <linux/types.h>
+#include <linux/init_syscalls.h>
+#include <linux/umh.h>
+#include <linux/security.h>
 
+
+// main
 // This section is still under progress
+//......//
 
 static void __init do_ctors(void)
 {
@@ -73,45 +88,246 @@ static bool __init_or_module initcall_blacklisted(initcall_t fn)
 		initrd_start = 0;
 	}
 #endif
-	setup_per_cpu_pageset();
-	numa_policy_init();
-	acpi_early_init();
-	if (late_time_init)
-		late_time_init();
-	sched_clock_init();
-	calibrate_delay();
+	static void __init initramfs_test_fname_overrun(struct kunit *test)
+{
+	char *err, *cpio_srcbuf;
+	size_t len, suffix_off;
+	struct initramfs_test_cpio c[] = { {
+		.magic = "070701",
+		.ino = 1,
+		.mode = S_IFREG | 0777,
+		.uid = 0,
+		.gid = 0,
+		.nlink = 1,
+		.mtime = 1,
+		.filesize = 0,
+		.devmajor = 0,
+		.devminor = 1,
+		.rdevmajor = 0,
+		.rdevminor = 0,
+		.namesize = sizeof("initramfs_test_fname_overrun"),
+		.csum = 0,
+		.fname = "initramfs_test_fname_overrun",
+	} };
 
-	arch_cpu_finalize_init();
+	/*
+	 * poison cpio source buffer, so we can detect overrun. source
+	 * buffer is used by read_into() when hdr or fname
+	 * are already available (e.g. no compression).
+	 */
+	cpio_srcbuf = kmalloc(CPIO_HDRLEN + PATH_MAX + 3, GFP_KERNEL);
+	memset(cpio_srcbuf, 'B', CPIO_HDRLEN + PATH_MAX + 3);
+	/* limit overrun to avoid crashes / filp_open() ENAMETOOLONG */
+	cpio_srcbuf[CPIO_HDRLEN + strlen(c[0].fname) + 20] = '\0';
 
-	pid_idr_init();
-	anon_vma_init();
-	thread_stack_cache_init();
-	cred_init();
-	fork_init();
-	proc_caches_init();
-	uts_ns_init();
-	key_init();
-	security_init();
-	dbg_late_init();
-	net_ns_init();
-	vfs_caches_init();
-	pagecache_init();
-	signals_init();
-	seq_file_init();
-	proc_root_init();
-	nsfs_init();
-	pidfs_init();
-	cpuset_init();
-	mem_cgroup_init();
-	cgroup_init();
-	taskstats_init_early();
-	delayacct_init();
+	len = fill_cpio(c, ARRAY_SIZE(c), cpio_srcbuf);
+	/* overwrite trailing fname terminator and padding */
+	suffix_off = len - 1;
+	while (cpio_srcbuf[suffix_off] == '\0') {
+		cpio_srcbuf[suffix_off] = 'P';
+		suffix_off--;
+	}
 
-	acpi_subsystem_init();
-	arch_post_acpi_subsys_init();
-	kcsan_init();
+	err = unpack_to_rootfs(cpio_srcbuf, len);
+	KUNIT_EXPECT_NOT_NULL(test, err);
 
-	rest_init();
+	kfree(cpio_srcbuf);
+}
+
+static void __init initramfs_test_data(struct kunit *test)
+{
+	char *err, *cpio_srcbuf;
+	size_t len;
+	struct file *file;
+	struct initramfs_test_cpio c[] = { {
+		.magic = "070701",
+		.ino = 1,
+		.mode = S_IFREG | 0777,
+		.uid = 0,
+		.gid = 0,
+		.nlink = 1,
+		.mtime = 1,
+		.filesize = sizeof("ASDF") - 1,
+		.devmajor = 0,
+		.devminor = 1,
+		.rdevmajor = 0,
+		.rdevminor = 0,
+		.namesize = sizeof("initramfs_test_data"),
+		.csum = 0,
+		.fname = "initramfs_test_data",
+		.data = "ASDF",
+	} };
+
+	/* +6 for max name and data 4-byte padding */
+	cpio_srcbuf = kmalloc(CPIO_HDRLEN + c[0].namesize + c[0].filesize + 6,
+			      GFP_KERNEL);
+
+	len = fill_cpio(c, ARRAY_SIZE(c), cpio_srcbuf);
+
+	err = unpack_to_rootfs(cpio_srcbuf, len);
+	KUNIT_EXPECT_NULL(test, err);
+
+	file = filp_open(c[0].fname, O_RDONLY, 0);
+	if (IS_ERR(file)) {
+		KUNIT_FAIL(test, "open failed");
+		goto out;
+	}
+
+	/* read back file contents into @cpio_srcbuf and confirm match */
+	len = kernel_read(file, cpio_srcbuf, c[0].filesize, NULL);
+	KUNIT_EXPECT_EQ(test, len, c[0].filesize);
+	KUNIT_EXPECT_MEMEQ(test, cpio_srcbuf, c[0].data, len);
+
+	fput(file);
+	KUNIT_EXPECT_EQ(test, init_unlink(c[0].fname), 0);
+out:
+	kfree(cpio_srcbuf);
+}
+
+static void __init initramfs_test_csum(struct kunit *test)
+{
+	char *err, *cpio_srcbuf;
+	size_t len;
+	struct initramfs_test_cpio c[] = { {
+		/* 070702 magic indicates a valid csum is present */
+		.magic = "070702",
+		.ino = 1,
+		.mode = S_IFREG | 0777,
+		.nlink = 1,
+		.filesize = sizeof("ASDF") - 1,
+		.devminor = 1,
+		.namesize = sizeof("initramfs_test_csum"),
+		.csum = 'A' + 'S' + 'D' + 'F',
+		.fname = "initramfs_test_csum",
+		.data = "ASDF",
+	}, {
+		/* mix csum entry above with no-csum entry below */
+		.magic = "070701",
+		.ino = 2,
+		.mode = S_IFREG | 0777,
+		.nlink = 1,
+		.filesize = sizeof("ASDF") - 1,
+		.devminor = 1,
+		.namesize = sizeof("initramfs_test_csum_not_here"),
+		/* csum ignored */
+		.csum = 5555,
+		.fname = "initramfs_test_csum_not_here",
+		.data = "ASDF",
+	} };
+
+	cpio_srcbuf = kmalloc(8192, GFP_KERNEL);
+
+	len = fill_cpio(c, ARRAY_SIZE(c), cpio_srcbuf);
+
+	err = unpack_to_rootfs(cpio_srcbuf, len);
+	KUNIT_EXPECT_NULL(test, err);
+
+	KUNIT_EXPECT_EQ(test, init_unlink(c[0].fname), 0);
+	KUNIT_EXPECT_EQ(test, init_unlink(c[1].fname), 0);
+
+	/* mess up the csum and confirm that unpack fails */
+	c[0].csum--;
+	len = fill_cpio(c, ARRAY_SIZE(c), cpio_srcbuf);
+
+	err = unpack_to_rootfs(cpio_srcbuf, len);
+	KUNIT_EXPECT_NOT_NULL(test, err);
+
+	/*
+	 * file (with content) is still retained in case of bad-csum abort.
+	 * Perhaps we should change this.
+	 */
+	KUNIT_EXPECT_EQ(test, init_unlink(c[0].fname), 0);
+	KUNIT_EXPECT_EQ(test, init_unlink(c[1].fname), -ENOENT);
+	kfree(cpio_srcbuf);
+}
+
+/*
+ * hardlink hashtable may leak when the archive omits a trailer:
+ * https://lore.kernel.org/r/20241107002044.16477-10-ddiss@suse.de/
+ */
+static void __init initramfs_test_hardlink(struct kunit *test)
+{
+	char *err, *cpio_srcbuf;
+	size_t len;
+	struct kstat st0, st1;
+	struct initramfs_test_cpio c[] = { {
+		.magic = "070701",
+		.ino = 1,
+		.mode = S_IFREG | 0777,
+		.nlink = 2,
+		.devminor = 1,
+		.namesize = sizeof("initramfs_test_hardlink"),
+		.fname = "initramfs_test_hardlink",
+	}, {
+		/* hardlink data is present in last archive entry */
+		.magic = "070701",
+		.ino = 1,
+		.mode = S_IFREG | 0777,
+		.nlink = 2,
+		.filesize = sizeof("ASDF") - 1,
+		.devminor = 1,
+		.namesize = sizeof("initramfs_test_hardlink_link"),
+		.fname = "initramfs_test_hardlink_link",
+		.data = "ASDF",
+	} };
+
+	cpio_srcbuf = kmalloc(8192, GFP_KERNEL);
+
+	len = fill_cpio(c, ARRAY_SIZE(c), cpio_srcbuf);
+
+	err = unpack_to_rootfs(cpio_srcbuf, len);
+	KUNIT_EXPECT_NULL(test, err);
+
+	KUNIT_EXPECT_EQ(test, init_stat(c[0].fname, &st0, 0), 0);
+	KUNIT_EXPECT_EQ(test, init_stat(c[1].fname, &st1, 0), 0);
+	KUNIT_EXPECT_EQ(test, st0.ino, st1.ino);
+	KUNIT_EXPECT_EQ(test, st0.nlink, 2);
+	KUNIT_EXPECT_EQ(test, st1.nlink, 2);
+
+	KUNIT_EXPECT_EQ(test, init_unlink(c[0].fname), 0);
+	KUNIT_EXPECT_EQ(test, init_unlink(c[1].fname), 0);
+
+	kfree(cpio_srcbuf);
+}
+
+#define INITRAMFS_TEST_MANY_LIMIT 1000
+#define INITRAMFS_TEST_MANY_PATH_MAX (sizeof("initramfs_test_many-") \
+			+ sizeof(__stringify(INITRAMFS_TEST_MANY_LIMIT)))
+static void __init initramfs_test_many(struct kunit *test)
+{
+	char *err, *cpio_srcbuf, *p;
+	size_t len = INITRAMFS_TEST_MANY_LIMIT *
+		     (CPIO_HDRLEN + INITRAMFS_TEST_MANY_PATH_MAX + 3);
+	char thispath[INITRAMFS_TEST_MANY_PATH_MAX];
+	int i;
+
+	p = cpio_srcbuf = kmalloc(len, GFP_KERNEL);
+
+	for (i = 0; i < INITRAMFS_TEST_MANY_LIMIT; i++) {
+		struct initramfs_test_cpio c = {
+			.magic = "070701",
+			.ino = i,
+			.mode = S_IFREG | 0777,
+			.nlink = 1,
+			.devminor = 1,
+			.fname = thispath,
+		};
+
+		c.namesize = 1 + sprintf(thispath, "initramfs_test_many-%d", i);
+		p += fill_cpio(&c, 1, p);
+	}
+
+	len = p - cpio_srcbuf;
+	err = unpack_to_rootfs(cpio_srcbuf, len);
+	KUNIT_EXPECT_NULL(test, err);
+
+	for (i = 0; i < INITRAMFS_TEST_MANY_LIMIT; i++) {
+		sprintf(thispath, "initramfs_test_many-%d", i);
+		KUNIT_EXPECT_EQ(test, init_unlink(thispath), 0);
+	}
+
+	kfree(cpio_srcbuf);
+}
 
 #if !__has_attribute(__no_stack_protector__)
 	prevent_tail_call_optimization();
@@ -183,6 +399,337 @@ static inline void do_trace_initcall_start(initcall_t fn)
 		return;
 	trace_initcall_start_cb(&initcall_calltime, fn);
 }
+
+static __initdata bool csum_present;
+static __initdata u32 io_csum;
+
+static ssize_t __init xwrite(struct file *file, const unsigned char *p,
+		size_t count, loff_t *pos)
+{
+	ssize_t out = 0;
+
+	/* sys_write only can write MAX_RW_COUNT aka 2G-4K bytes at most */
+	while (count) {
+		ssize_t rv = kernel_write(file, p, count, pos);
+
+		if (rv < 0) {
+			if (rv == -EINTR || rv == -EAGAIN)
+				continue;
+			return out ? out : rv;
+		} else if (rv == 0)
+			break;
+
+		if (csum_present) {
+			ssize_t i;
+
+			for (i = 0; i < rv; i++)
+				io_csum += p[i];
+		}
+
+		p += rv;
+		out += rv;
+		count -= rv;
+	}
+
+	return out;
+}
+
+static __initdata char *message;
+static void __init error(char *x)
+{
+	if (!message)
+		message = x;
+}
+
+#define panic_show_mem(fmt, ...) \
+	({ show_mem(); panic(fmt, ##__VA_ARGS__); })
+
+/* link hash */
+
+#define N_ALIGN(len) ((((len) + 1) & ~3) + 2)
+
+static __initdata struct hash {
+	int ino, minor, major;
+	umode_t mode;
+	struct hash *next;
+	char name[N_ALIGN(PATH_MAX)];
+} *head[32];
+static __initdata bool hardlink_seen;
+
+static inline int hash(int major, int minor, int ino)
+{
+	unsigned long tmp = ino + minor + (major << 3);
+	tmp += tmp >> 5;
+	return tmp & 31;
+}
+
+static char __init *find_link(int major, int minor, int ino,
+			      umode_t mode, char *name)
+{
+	struct hash **p, *q;
+	for (p = head + hash(major, minor, ino); *p; p = &(*p)->next) {
+		if ((*p)->ino != ino)
+			continue;
+		if ((*p)->minor != minor)
+			continue;
+		if ((*p)->major != major)
+			continue;
+		if (((*p)->mode ^ mode) & S_IFMT)
+			continue;
+		return (*p)->name;
+	}
+	q = kmalloc(sizeof(struct hash), GFP_KERNEL);
+	if (!q)
+		panic_show_mem("can't allocate link hash entry");
+	q->major = major;
+	q->minor = minor;
+	q->ino = ino;
+	q->mode = mode;
+	strcpy(q->name, name);
+	q->next = NULL;
+	*p = q;
+	hardlink_seen = true;
+	return NULL;
+}
+
+static void __init free_hash(void)
+{
+	struct hash **p, *q;
+	for (p = head; hardlink_seen && p < head + 32; p++) {
+		while (*p) {
+			q = *p;
+			*p = q->next;
+			kfree(q);
+		}
+	}
+	hardlink_seen = false;
+}
+
+#ifdef CONFIG_INITRAMFS_PRESERVE_MTIME
+static void __init do_utime(char *filename, time64_t mtime)
+{
+	struct timespec64 t[2] = { { .tv_sec = mtime }, { .tv_sec = mtime } };
+	init_utimes(filename, t);
+}
+
+static void __init do_utime_path(const struct path *path, time64_t mtime)
+{
+	struct timespec64 t[2] = { { .tv_sec = mtime }, { .tv_sec = mtime } };
+	vfs_utimes(path, t);
+}
+
+static __initdata LIST_HEAD(dir_list);
+struct dir_entry {
+	struct list_head list;
+	time64_t mtime;
+	char name[];
+};
+
+static void __init dir_add(const char *name, size_t nlen, time64_t mtime)
+{
+	struct dir_entry *de;
+
+	de = kmalloc(sizeof(struct dir_entry) + nlen, GFP_KERNEL);
+	if (!de)
+		panic_show_mem("can't allocate dir_entry buffer");
+	INIT_LIST_HEAD(&de->list);
+	strscpy(de->name, name, nlen);
+	de->mtime = mtime;
+	list_add(&de->list, &dir_list);
+}
+
+static void __init dir_utime(void)
+{
+	struct dir_entry *de, *tmp;
+	list_for_each_entry_safe(de, tmp, &dir_list, list) {
+		list_del(&de->list);
+		do_utime(de->name, de->mtime);
+		kfree(de);
+	}
+}
+#else
+static void __init do_utime(char *filename, time64_t mtime) {}
+static void __init do_utime_path(const struct path *path, time64_t mtime) {}
+static void __init dir_add(const char *name, size_t nlen, time64_t mtime) {}
+static void __init dir_utime(void) {}
+#endif
+
+static __initdata time64_t mtime;
+
+/* cpio header parsing */
+
+static __initdata unsigned long ino, major, minor, nlink;
+static __initdata umode_t mode;
+static __initdata unsigned long body_len, name_len;
+static __initdata uid_t uid;
+static __initdata gid_t gid;
+static __initdata unsigned rdev;
+static __initdata u32 hdr_csum;
+
+static void __init parse_header(char *s)
+{
+	unsigned long parsed[13];
+	int i;
+
+	for (i = 0, s += 6; i < 13; i++, s += 8)
+		parsed[i] = simple_strntoul(s, NULL, 16, 8);
+
+	ino = parsed[0];
+	mode = parsed[1];
+	uid = parsed[2];
+	gid = parsed[3];
+	nlink = parsed[4];
+	mtime = parsed[5]; /* breaks in y2106 */
+	body_len = parsed[6];
+	major = parsed[7];
+	minor = parsed[8];
+	rdev = new_encode_dev(MKDEV(parsed[9], parsed[10]));
+	name_len = parsed[11];
+	hdr_csum = parsed[12];
+}
+
+/* FSM */
+
+static __initdata enum state {
+	Start,
+	Collect,
+	GotHeader,
+	SkipIt,
+	GotName,
+	CopyFile,
+	GotSymlink,
+	Reset
+} state, next_state;
+
+static __initdata char *victim;
+static unsigned long byte_count __initdata;
+static __initdata loff_t this_header, next_header;
+
+static inline void __init eat(unsigned n)
+{
+	victim += n;
+	this_header += n;
+	byte_count -= n;
+}
+
+static __initdata char *collected;
+static long remains __initdata;
+static __initdata char *collect;
+
+static void __init read_into(char *buf, unsigned size, enum state next)
+{
+	if (byte_count >= size) {
+		collected = victim;
+		eat(size);
+		state = next;
+	} else {
+		collect = collected = buf;
+		remains = size;
+		next_state = next;
+		state = Collect;
+	}
+}
+
+static __initdata char *header_buf, *symlink_buf, *name_buf;
+
+static int __init do_start(void)
+{
+	read_into(header_buf, CPIO_HDRLEN, GotHeader);
+	return 0;
+}
+
+static int __init do_collect(void)
+{
+	unsigned long n = remains;
+	if (byte_count < n)
+		n = byte_count;
+	memcpy(collect, victim, n);
+	eat(n);
+	collect += n;
+	if ((remains -= n) != 0)
+		return 1;
+	state = next_state;
+	return 0;
+}
+
+static int __init do_header(void)
+{
+	if (!memcmp(collected, "070701", 6)) {
+		csum_present = false;
+	} else if (!memcmp(collected, "070702", 6)) {
+		csum_present = true;
+	} else {
+		if (memcmp(collected, "070707", 6) == 0)
+			error("incorrect cpio method used: use -H newc option");
+		else
+			error("no cpio magic");
+		return 1;
+	}
+	parse_header(collected);
+	next_header = this_header + N_ALIGN(name_len) + body_len;
+	next_header = (next_header + 3) & ~3;
+	state = SkipIt;
+	if (name_len <= 0 || name_len > PATH_MAX)
+		return 0;
+	if (S_ISLNK(mode)) {
+		if (body_len > PATH_MAX)
+			return 0;
+		collect = collected = symlink_buf;
+		remains = N_ALIGN(name_len) + body_len;
+		next_state = GotSymlink;
+		state = Collect;
+		return 0;
+	}
+	if (S_ISREG(mode) || !body_len)
+		read_into(name_buf, N_ALIGN(name_len), GotName);
+	return 0;
+}
+
+static int __init do_skip(void)
+{
+	if (this_header + byte_count < next_header) {
+		eat(byte_count);
+		return 1;
+	} else {
+		eat(next_header - this_header);
+		state = next_state;
+		return 0;
+	}
+}
+
+static int __init do_reset(void)
+{
+	while (byte_count && *victim == '\0')
+		eat(1);
+	if (byte_count && (this_header & 3))
+		error("broken padding");
+	return 1;
+}
+
+static void __init clean_path(char *path, umode_t fmode)
+{
+	struct kstat st;
+
+	if (!init_stat(path, &st, AT_SYMLINK_NOFOLLOW) &&
+	    (st.mode ^ fmode) & S_IFMT) {
+		if (S_ISDIR(st.mode))
+			init_rmdir(path);
+		else
+			init_unlink(path);
+	}
+}
+
+static int __init maybe_link(void)
+{
+	if (nlink >= 2) {
+		char *old = find_link(major, minor, ino, mode, collected);
+		if (old) {
+			return 0; // WW.T.B.C //
+		}
+	}
+	return 0;
+}
+
 static inline void do_trace_initcall_finish(initcall_t fn, int ret)
 {
 	if (!initcall_debug)
@@ -197,4 +744,50 @@ static inline void do_trace_initcall_level(const char *level)
 }
 #endif /* !TRACEPOINTS_ENABLED */
 
+
+static __initdata int (*actions[])(void) = {
+	[Start]		= do_start,
+	[Collect]	= do_collect,
+	[GotHeader]	= do_header,
+	[SkipIt]	= do_skip,
+	[GotName]	= do_name,
+	[CopyFile]	= do_copy,
+	[GotSymlink]	= do_symlink,
+	[Reset]		= do_reset,
+};
+
+static long __init write_buffer(char *buf, unsigned long len)
+{
+	byte_count = len;
+	victim = buf;
+
+	while (!actions[state]())
+		;
+	return len - byte_count;
+}
+
+static long __init flush_buffer(void *bufv, unsigned long len)
+{
+	char *buf = bufv;
+	long written;
+	long origLen = len;
+	if (message)
+		return -1;
+	while ((written = write_buffer(buf, len)) < len && !message) {
+		char c = buf[written];
+		if (c == '0') {
+			buf += written;
+			len -= written;
+			state = Start;
+		} else if (c == 0) {
+			buf += written;
+			len -= written;
+			state = Reset;
+		} else
+			error("junk within compressed archive");
+	}
+	return origLen;
+}
+
+//WTBD////
 /* Soon */

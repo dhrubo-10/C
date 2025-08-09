@@ -983,7 +983,134 @@ void print_hex_dump(const char *level, const char *prefix_str, int prefix_type,
 }
 EXPORT_SYMBOL(print_hex_dump);
 
-#endif /* defined(CONFIG_PRINTK) */
+#endif // defined(CONFIG_PRINTK) 
+
+static void reset_idle_masks(struct sched_ext_ops *ops)
+{
+	int node;
+
+	if (!(ops->flags & SCX_OPS_BUILTIN_IDLE_PER_NODE)) {
+		cpumask_copy(idle_cpumask(NUMA_NO_NODE)->cpu, cpu_online_mask);
+		cpumask_copy(idle_cpumask(NUMA_NO_NODE)->smt, cpu_online_mask);
+		return;
+	}
+
+	for_each_node(node) {
+		const struct cpumask *node_mask = cpumask_of_node(node);
+
+		cpumask_and(idle_cpumask(node)->cpu, cpu_online_mask, node_mask);
+		cpumask_and(idle_cpumask(node)->smt, cpu_online_mask, node_mask);
+	}
+}
+
+void scx_idle_enable(struct sched_ext_ops *ops)
+{
+	if (!ops->update_idle || (ops->flags & SCX_OPS_KEEP_BUILTIN_IDLE))
+		static_branch_enable_cpuslocked(&scx_builtin_idle_enabled);
+	else
+		static_branch_disable_cpuslocked(&scx_builtin_idle_enabled);
+
+	if (ops->flags & SCX_OPS_BUILTIN_IDLE_PER_NODE)
+		static_branch_enable_cpuslocked(&scx_builtin_idle_per_node);
+	else
+		static_branch_disable_cpuslocked(&scx_builtin_idle_per_node);
+
+	reset_idle_masks(ops);
+}
+
+void scx_idle_disable(void)
+{
+	static_branch_disable(&scx_builtin_idle_enabled);
+	static_branch_disable(&scx_builtin_idle_per_node);
+}
+
+
+static int validate_node(int node)
+{
+	if (!static_branch_likely(&scx_builtin_idle_per_node)) {
+		scx_kf_error("per-node idle tracking is disabled");
+		return -EOPNOTSUPP;
+	}
+
+	if (node == NUMA_NO_NODE)
+		return -ENOENT;
+
+	if (node < 0 || node >= nr_node_ids) {
+		scx_kf_error("invalid node %d", node);
+		return -EINVAL;
+	}
+
+	if (!node_possible(node)) {
+		scx_kf_error("unavailable node %d", node);
+		return -EINVAL;
+	}
+
+	return node;
+}
+
+__bpf_kfunc_start_defs();
+
+static bool check_builtin_idle_enabled(void)
+{
+	if (static_branch_likely(&scx_builtin_idle_enabled))
+		return true;
+
+	scx_kf_error("built-in idle tracking is disabled");
+	return false;
+}
+
+static s32 select_cpu_from_kfunc(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
+				 const struct cpumask *allowed, u64 flags)
+{
+	struct rq *rq;
+	struct rq_flags rf;
+	s32 cpu;
+
+	if (!kf_cpu_valid(prev_cpu, NULL))
+		return -EINVAL;
+
+	if (!check_builtin_idle_enabled())
+		return -EBUSY;
+
+
+	if (scx_kf_allowed_if_unlocked()) {
+		rq = task_rq_lock(p, &rf);
+	} else {
+		if (!scx_kf_allowed(SCX_KF_SELECT_CPU | SCX_KF_ENQUEUE))
+			return -EPERM;
+		rq = scx_locked_rq();
+	}
+
+
+	if (!rq)
+		lockdep_assert_held(&p->pi_lock);
+
+
+	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p)) {
+		if (cpumask_test_cpu(prev_cpu, allowed ?: p->cpus_ptr) &&
+		    scx_idle_test_and_clear_cpu(prev_cpu))
+			cpu = prev_cpu;
+		else
+			cpu = -EBUSY;
+	} else {
+		cpu = scx_select_cpu_dfl(p, prev_cpu, wake_flags,
+					 allowed ?: p->cpus_ptr, flags);
+	}
+
+	if (scx_kf_allowed_if_unlocked())
+		task_rq_unlock(rq, p, &rf);
+
+	return cpu;
+}
+
+
+__bpf_kfunc int scx_bpf_cpu_node(s32 cpu)
+{
+	if (!kf_cpu_valid(cpu, NULL))
+		return NUMA_NO_NODE;
+
+	return cpu_to_node(cpu);
+}
 
 //WTBD////
 /* Soon */

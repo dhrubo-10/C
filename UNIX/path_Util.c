@@ -119,11 +119,8 @@ static bool __init_or_module initcall_blacklisted(initcall_t fn)
 		.fname = "initramfs_test_fname_overrun",
 	} };
 
-	/*
-	 * poison cpio source buffer, so we can detect overrun. source
-	 * buffer is used by read_into() when hdr or fname
-	 * are already available (e.g. no compression).
-	 */
+	
+	
 	cpio_srcbuf = kmalloc(CPIO_HDRLEN + PATH_MAX + 3, GFP_KERNEL);
 	memset(cpio_srcbuf, 'B', CPIO_HDRLEN + PATH_MAX + 3);
 	/* limit overrun to avoid crashes / filp_open() ENAMETOOLONG */
@@ -192,6 +189,145 @@ static void __init initramfs_test_data(struct kunit *test)
 out:
 	kfree(cpio_srcbuf);
 }
+
+
+unsigned long initrd_start, initrd_end;
+int initrd_below_start_ok;
+static unsigned int real_root_dev;	/* do_proc_dointvec cannot handle kdev_t */
+static int __initdata mount_initrd = 1;
+
+phys_addr_t phys_initrd_start __initdata;
+unsigned long phys_initrd_size __initdata;
+
+#ifdef CONFIG_SYSCTL
+static const struct ctl_table kern_do_mounts_initrd_table[] = {
+	{
+		.procname       = "real-root-dev",
+		.data           = &real_root_dev,
+		.maxlen         = sizeof(int),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec,
+	},
+};
+
+static __init int kernel_do_mounts_initrd_sysctls_init(void)
+{
+	register_sysctl_init("kernel", kern_do_mounts_initrd_table);
+	return 0;
+}
+late_initcall(kernel_do_mounts_initrd_sysctls_init);
+#endif /* CONFIG_SYSCTL */
+
+static int __init no_initrd(char *str)
+{
+	mount_initrd = 0;
+	return 1;
+}
+
+__setup("noinitrd", no_initrd);
+
+static int __init early_initrdmem(char *p)
+{
+	phys_addr_t start;
+	unsigned long size;
+	char *endp;
+
+	start = memparse(p, &endp);
+	if (*endp == ',') {
+		size = memparse(endp + 1, NULL);
+
+		phys_initrd_start = start;
+		phys_initrd_size = size;
+	}
+	return 0;
+}
+early_param("initrdmem", early_initrdmem);
+
+static int __init early_initrd(char *p)
+{
+	return early_initrdmem(p);
+}
+early_param("initrd", early_initrd);
+
+static int __init init_linuxrc(struct subprocess_info *info, struct cred *new)
+{
+	ksys_unshare(CLONE_FS | CLONE_FILES);
+	console_on_rootfs();
+	/* move initrd over / and chdir/chroot in initrd root */
+	init_chdir("/root");
+	init_mount(".", "/", NULL, MS_MOVE, NULL);
+	init_chroot(".");
+	ksys_setsid();
+	return 0;
+}
+
+static void __init handle_initrd(char *root_device_name)
+{
+	struct subprocess_info *info;
+	static char *argv[] = { "linuxrc", NULL, };
+	extern char *envp_init[];
+	int error;
+
+	pr_warn("using deprecated initrd support, will be removed soon.\n");
+
+	real_root_dev = new_encode_dev(ROOT_DEV);
+	create_dev("/dev/root.old", Root_RAM0);
+	/* mount initrd on rootfs' /root */
+	mount_root_generic("/dev/root.old", root_device_name,
+			   root_mountflags & ~MS_RDONLY);
+	init_mkdir("/old", 0700);
+	init_chdir("/old");
+
+	info = call_usermodehelper_setup("/linuxrc", argv, envp_init,
+					 GFP_KERNEL, init_linuxrc, NULL, NULL);
+	if (!info)
+		return;
+	call_usermodehelper_exec(info, UMH_WAIT_PROC|UMH_FREEZABLE);
+
+	/* move initrd to rootfs' /old */
+	init_mount("..", ".", NULL, MS_MOVE, NULL);
+	/* switch root and cwd back to / of rootfs */
+	init_chroot("..");
+
+	if (new_decode_dev(real_root_dev) == Root_RAM0) {
+		init_chdir("/old");
+		return;
+	}
+
+	init_chdir("/");
+	ROOT_DEV = new_decode_dev(real_root_dev);
+	mount_root(root_device_name);
+
+	printk(KERN_NOTICE "Trying to move old root to /initrd ... ");
+	error = init_mount("/old", "/root/initrd", NULL, MS_MOVE, NULL);
+	if (!error)
+		printk("okay\n");
+	else {
+		if (error == -ENOENT)
+			printk("/initrd does not exist. Ignored.\n");
+		else
+			printk("failed\n");
+		printk(KERN_NOTICE "Unmounting old root\n");
+		init_umount("/old", MNT_DETACH);
+	}
+}
+
+bool __init initrd_load(char *root_device_name)
+{
+	if (mount_initrd) {
+		create_dev("/dev/ram", Root_RAM0);
+
+		if (rd_load_image("/initrd.image") && ROOT_DEV != Root_RAM0) {
+			init_unlink("/initrd.image");
+			handle_initrd(root_device_name);
+			return true;
+		}
+	}
+	init_unlink("/initrd.image");
+	return false;
+}
+
+
 
 static void __init initramfs_test_csum(struct kunit *test)
 {
@@ -501,18 +637,181 @@ static char __init *find_link(int major, int minor, int ino,
 	return NULL;
 }
 
-static void __init free_hash(void)
+__setup("rootwait", rootwait_setup);
+
+static int __init rootwait_timeout_setup(char *str)
 {
-	struct hash **p, *q;
-	for (p = head; hardlink_seen && p < head + 32; p++) {
-		while (*p) {
-			q = *p;
-			*p = q->next;
-			kfree(q);
+	int sec;
+
+	if (kstrtoint(str, 0, &sec) || sec < 0) {
+		pr_warn("ignoring invalid rootwait value\n");
+		goto ignore;
+	}
+
+	if (check_mul_overflow(sec, MSEC_PER_SEC, &root_wait)) {
+		pr_warn("ignoring excessive rootwait value\n");
+		goto ignore;
+	}
+
+	return 1;
+
+ignore:
+	/* Fallback to indefinite wait */
+	root_wait = -1;
+
+	return 1;
+}
+
+__setup("rootwait=", rootwait_timeout_setup);
+
+static char * __initdata root_mount_data;
+static int __init root_data_setup(char *str)
+{
+	root_mount_data = str;
+	return 1;
+}
+
+static char * __initdata root_fs_names;
+static int __init fs_names_setup(char *str)
+{
+	root_fs_names = str;
+	return 1;
+}
+
+static unsigned int __initdata root_delay;
+static int __init root_delay_setup(char *str)
+{
+	root_delay = simple_strtoul(str, NULL, 0);
+	return 1;
+}
+
+__setup("rootflags=", root_data_setup);
+__setup("rootfstype=", fs_names_setup);
+__setup("rootdelay=", root_delay_setup);
+
+/* This can return zero length strings. Caller should check */
+static int __init split_fs_names(char *page, size_t size)
+{
+	int count = 1;
+	char *p = page;
+
+	strscpy(p, root_fs_names, size);
+	while (*p++) {
+		if (p[-1] == ',') {
+			p[-1] = '\0';
+			count++;
 		}
 	}
-	hardlink_seen = false;
+
+	return count;
 }
+
+static int __init do_mount_root(const char *name, const char *fs,
+				 const int flags, const void *data)
+{
+	struct super_block *s;
+	struct page *p = NULL;
+	char *data_page = NULL;
+	int ret;
+
+	if (data) {
+		/* init_mount() requires a full page as fifth argument */
+		p = alloc_page(GFP_KERNEL);
+		if (!p)
+			return -ENOMEM;
+		data_page = page_address(p);
+		strscpy_pad(data_page, data, PAGE_SIZE);
+	}
+
+	ret = init_mount(name, "/root", fs, flags, data_page);
+	if (ret)
+		goto out;
+
+	init_chdir("/root");
+	s = current->fs->pwd.dentry->d_sb;
+	ROOT_DEV = s->s_dev;
+	printk(KERN_INFO
+	       "VFS: Mounted root (%s filesystem)%s on device %u:%u.\n",
+	       s->s_type->name,
+	       sb_rdonly(s) ? " readonly" : "",
+	       MAJOR(ROOT_DEV), MINOR(ROOT_DEV));
+
+out:
+	if (p)
+		put_page(p);
+	return ret;
+}
+
+void __init mount_root_generic(char *name, char *pretty_name, int flags)
+{
+	struct page *page = alloc_page(GFP_KERNEL);
+	char *fs_names = page_address(page);
+	char *p;
+	char b[BDEVNAME_SIZE];
+	int num_fs, i;
+
+	scnprintf(b, BDEVNAME_SIZE, "unknown-block(%u,%u)",
+		  MAJOR(ROOT_DEV), MINOR(ROOT_DEV));
+	if (root_fs_names)
+		num_fs = split_fs_names(fs_names, PAGE_SIZE);
+	else
+		num_fs = list_bdev_fs_names(fs_names, PAGE_SIZE);
+retry:
+	for (i = 0, p = fs_names; i < num_fs; i++, p += strlen(p)+1) {
+		int err;
+
+		if (!*p)
+			continue;
+		err = do_mount_root(name, p, flags, root_mount_data);
+		switch (err) {
+			case 0:
+				goto out;
+			case -EACCES:
+			case -EINVAL:
+#ifdef CONFIG_BLOCK
+				init_flush_fput();
+#endif
+				continue;
+		}
+	        /*
+		 * Allow the user to distinguish between failed sys_open
+		 * and bad superblock on root device.
+		 * and give them a list of the available devices
+		 */
+		printk("VFS: Cannot open root device \"%s\" or %s: error %d\n",
+				pretty_name, b, err);
+		printk("Please append a correct \"root=\" boot option; here are the available partitions:\n");
+		printk_all_partitions();
+
+		if (root_fs_names)
+			num_fs = list_bdev_fs_names(fs_names, PAGE_SIZE);
+		if (!num_fs)
+			pr_err("Can't find any bdev filesystem to be used for mount!\n");
+		else {
+			pr_err("List of all bdev filesystems:\n");
+			for (i = 0, p = fs_names; i < num_fs; i++, p += strlen(p)+1)
+				pr_err(" %s", p);
+			pr_err("\n");
+		}
+
+		panic("VFS: Unable to mount root fs on %s", b);
+	}
+	if (!(flags & SB_RDONLY)) {
+		flags |= SB_RDONLY;
+		goto retry;
+	}
+
+	printk("List of all partitions:\n");
+	printk_all_partitions();
+	printk("No filesystem could mount root, tried: ");
+	for (i = 0, p = fs_names; i < num_fs; i++, p += strlen(p)+1)
+		printk(" %s", p);
+	printk("\n");
+	panic("VFS: Unable to mount root fs on \"%s\" or %s", pretty_name, b);
+out:
+	put_page(page);
+}
+
 
 #ifdef CONFIG_INITRAMFS_PRESERVE_MTIME
 static void __init do_utime(char *filename, time64_t mtime)
@@ -565,7 +864,7 @@ static void __init dir_utime(void) {}
 
 static __initdata time64_t mtime;
 
-/* cpio header parsing */
+
 
 static __initdata unsigned long ino, major, minor, nlink;
 static __initdata umode_t mode;

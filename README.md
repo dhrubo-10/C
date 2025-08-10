@@ -1,38 +1,27 @@
-# 🧠 C Learning Lab 🚀
+# C Learning Lab 
 
 Welcome to my **C Programming Playground** — a personal repo where I practice, break, and build using pure C.
 
-## 📌 About This Repo
+## About This Repo
 
 This repository contains my journey through the C language, including:
-- ✅ Basic syntax and concepts
-- 🔁 Loops and conditionals
-- 📦 Functions and arrays
-- 🔗 Pointers and memory
-- 📂 Mini-projects and practice problems
+- Syntax and concepts
+- Mini-projects and practice problems
+- My custom Linux kernel project and updates on that as i keep working.
 
+## Tools Used
 
-## 🛠️ Tools Used
+- Language: `C (C99/C11), ANSI C`
+- Compiler: `gcc, clang, llvm`
+- OS: `Arch`
+- Editor: `vim / subl`
 
-- Language: `C (C99/C11)`
-- Compiler: `gcc`
-- OS: `Arch Linux`
-- Editor: `Neovim / Subl`
+## Why I'm Doing This
 
-## 🚧 Currently Practicing
-
-- Pointers
-- String manipulation
-- File handling
-- Building small CLI tools
-
-## 📚 Why I'm Doing This
-
-C builds the foundation of how computers really work.  
-I want to master the fundamentals — to think like a real programmer, not just use frameworks.
+Working on low-level programming is not just a hobby for me — it's my favorite pastime and a true passion. I enjoy building kernels while also practicing fundamental C projects, purely for the fun of it.  
 
 ---
 
-Thanks for stopping by! ⭐  
-Feel free to fork, suggest improvements, or follow my journey!
+If you happen to come across this section, feel free to fork the project or share suggestions for improvement!
+
 

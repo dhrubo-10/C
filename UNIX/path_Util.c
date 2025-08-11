@@ -190,6 +190,19 @@ out:
 	kfree(cpio_srcbuf);
 }
 
+#ifdef CONFIG_CRASH_DUMP
+static void __init setup_zfcpdump(void)
+{
+	if (!is_ipl_type_dump())
+		return;
+	if (oldmem_data.start)
+		return;
+	strlcat(boot_command_line, " cio_ignore=all,!ipldev,!condev", COMMAND_LINE_SIZE);
+	console_loglevel = 2;
+}
+#else
+static inline void setup_zfcpdump(void) {}
+#endif /
 
 unsigned long initrd_start, initrd_end;
 int initrd_below_start_ok;
@@ -208,6 +221,85 @@ static const struct ctl_table kern_do_mounts_initrd_table[] = {
 		.mode           = 0644,
 		.proc_handler   = proc_dointvec,
 	},
+	struct lowcore *lc, *abs_lc;
+
+	/*
+	 * Setup lowcore for boot cpu
+	 */
+	BUILD_BUG_ON(sizeof(struct lowcore) != LC_PAGES * PAGE_SIZE);
+	lc = memblock_alloc_low(sizeof(*lc), sizeof(*lc));
+	if (!lc)
+		panic("%s: Failed to allocate %zu bytes align=%zx\n",
+		      __func__, sizeof(*lc), sizeof(*lc));
+
+	lc->pcpu = (unsigned long)per_cpu_ptr(&pcpu_devices, 0);
+	lc->restart_psw.mask = PSW_KERNEL_BITS & ~PSW_MASK_DAT;
+	lc->restart_psw.addr = __pa(restart_int_handler);
+	lc->external_new_psw.mask = PSW_KERNEL_BITS;
+	lc->external_new_psw.addr = (unsigned long) ext_int_handler;
+	lc->svc_new_psw.mask = PSW_KERNEL_BITS;
+	lc->svc_new_psw.addr = (unsigned long) system_call;
+	lc->program_new_psw.mask = PSW_KERNEL_BITS;
+	lc->program_new_psw.addr = (unsigned long) pgm_check_handler;
+	lc->mcck_new_psw.mask = PSW_KERNEL_BITS;
+	lc->mcck_new_psw.addr = (unsigned long) mcck_int_handler;
+	lc->io_new_psw.mask = PSW_KERNEL_BITS;
+	lc->io_new_psw.addr = (unsigned long) io_int_handler;
+	lc->clock_comparator = clock_comparator_max;
+	lc->current_task = (unsigned long)&init_task;
+	lc->lpp = LPP_MAGIC;
+	lc->preempt_count = get_lowcore()->preempt_count;
+	nmi_alloc_mcesa_early(&lc->mcesad);
+	lc->sys_enter_timer = get_lowcore()->sys_enter_timer;
+	lc->exit_timer = get_lowcore()->exit_timer;
+	lc->user_timer = get_lowcore()->user_timer;
+	lc->system_timer = get_lowcore()->system_timer;
+	lc->steal_timer = get_lowcore()->steal_timer;
+	lc->last_update_timer = get_lowcore()->last_update_timer;
+	lc->last_update_clock = get_lowcore()->last_update_clock;
+	/*
+	  Allocate the global restart stack which is the same for
+	  all CPUs in case *one* of them does a PSW restart.
+	 */
+	restart_stack = (void *)(stack_alloc_early() + STACK_INIT_OFFSET);
+	lc->mcck_stack = stack_alloc_early() + STACK_INIT_OFFSET;
+	lc->async_stack = stack_alloc_early() + STACK_INIT_OFFSET;
+	lc->nodat_stack = stack_alloc_early() + STACK_INIT_OFFSET;
+	lc->kernel_stack = get_lowcore()->kernel_stack;
+	/*
+	  Set up PSW restart to call ipl.c:do_restart(). Copy the relevant
+	 restart data to the absolute zero lowcore. This is necessary if
+	  PSW restart is done on an offline CPU that has lowcore zero.
+	 */
+	lc->restart_stack = (unsigned long) restart_stack;
+	lc->restart_fn = (unsigned long) do_restart;
+	lc->restart_data = 0;
+	lc->restart_source = -1U;
+	lc->spinlock_lockval = arch_spin_lockval(0);
+	lc->spinlock_index = 0;
+	arch_spin_lock_setup(0);
+	lc->return_lpswe = gen_lpswe(__LC_RETURN_PSW);
+	lc->return_mcck_lpswe = gen_lpswe(__LC_RETURN_MCCK_PSW);
+	lc->preempt_count = PREEMPT_DISABLED;
+	lc->kernel_asce = get_lowcore()->kernel_asce;
+	lc->user_asce = get_lowcore()->user_asce;
+
+	system_ctlreg_init_save_area(lc);
+	abs_lc = get_abs_lowcore();
+	abs_lc->restart_stack = lc->restart_stack;
+	abs_lc->restart_fn = lc->restart_fn;
+	abs_lc->restart_data = lc->restart_data;
+	abs_lc->restart_source = lc->restart_source;
+	abs_lc->restart_psw = lc->restart_psw;
+	abs_lc->restart_flags = RESTART_FLAG_CTLREGS;
+	abs_lc->program_new_psw = lc->program_new_psw;
+	abs_lc->mcesad = lc->mcesad;
+	put_abs_lowcore(abs_lc);
+
+	set_prefix(__pa(lc));
+	lowcore_ptr[0] = lc;
+	if (abs_lowcore_map(0, lowcore_ptr[0], false))
+		panic("Couldn't setup absolute lowcore");
 };
 
 static __init int kernel_do_mounts_initrd_sysctls_init(void)
@@ -1410,6 +1502,535 @@ __bpf_kfunc int scx_bpf_cpu_node(s32 cpu)
 
 	return cpu_to_node(cpu);
 }
+
+
+static struct resource code_resource = {
+	.name  = "Kernel code",
+	.flags = IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM,
+};
+
+static struct resource data_resource = {
+	.name = "Kernel data",
+	.flags = IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM,
+};
+
+static struct resource bss_resource = {
+	.name = "Kernel bss",
+	.flags = IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM,
+};
+
+static struct resource __initdata *standard_resources[] = {
+	&code_resource,
+	&data_resource,
+	&bss_resource,
+};
+
+static void __init setup_resources(void)
+{
+	struct resource *res, *std_res, *sub_res;
+	phys_addr_t start, end;
+	int j;
+	u64 i;
+
+	code_resource.start = __pa_symbol(_text);
+	code_resource.end = __pa_symbol(_etext) - 1;
+	data_resource.start = __pa_symbol(_etext);
+	data_resource.end = __pa_symbol(_edata) - 1;
+	bss_resource.start = __pa_symbol(__bss_start);
+	bss_resource.end = __pa_symbol(__bss_stop) - 1;
+
+	for_each_mem_range(i, &start, &end) {
+		res = memblock_alloc_or_panic(sizeof(*res), 8);
+		res->flags = IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM;
+
+		res->name = "System RAM";
+		res->start = start;
+
+		res->end = end - 1;
+		request_resource(&iomem_resource, res);
+
+		for (j = 0; j < ARRAY_SIZE(standard_resources); j++) {
+			std_res = standard_resources[j];
+			if (std_res->start < res->start ||
+			    std_res->start > res->end)
+				continue;
+			if (std_res->end > res->end) {
+				sub_res = memblock_alloc_or_panic(sizeof(*sub_res), 8);
+				*sub_res = *std_res;
+				sub_res->end = res->end;
+				std_res->start = res->end + 1;
+				request_resource(res, sub_res);
+			} else {
+				request_resource(res, std_res);
+			}
+		}
+	}
+#ifdef CONFIG_CRASH_DUMP
+
+	if (crashk_res.end) {
+		memblock_add_node(crashk_res.start, resource_size(&crashk_res),
+				  0, MEMBLOCK_NONE);
+		memblock_reserve(crashk_res.start, resource_size(&crashk_res));
+		insert_resource(&iomem_resource, &crashk_res);
+	}
+#endif
+}
+
+static void __init setup_memory_end(void)
+{
+	max_pfn = max_low_pfn = PFN_DOWN(ident_map_size);
+	pr_notice("The maximum memory size is %luMB\n", ident_map_size >> 20);
+}
+
+#ifdef CONFIG_CRASH_DUMP
+
+
+static int kdump_mem_notifier(struct notifier_block *nb,
+			      unsigned long action, void *data)
+{
+	struct memory_notify *arg = data;
+
+	if (action != MEM_GOING_OFFLINE)
+		return NOTIFY_OK;
+	if (arg->start_pfn < PFN_DOWN(resource_size(&crashk_res)))
+		return NOTIFY_BAD;
+	return NOTIFY_OK;
+}
+
+static struct notifier_block kdump_mem_nb = {
+	.notifier_call = kdump_mem_notifier,
+};
+
+#endif
+
+/*
+ * Reserve page tables created by decompressor
+ */
+static void __init reserve_pgtables(void)
+{
+	unsigned long start, end;
+	struct reserved_range *range;
+
+	for_each_physmem_reserved_type_range(RR_VMEM, range, &start, &end)
+		memblock_reserve(start, end - start);
+}
+
+/*
+ * Reserve memory for kdump kernel to be loaded with kexec
+ */
+static void __init reserve_crashkernel(void)
+{
+#ifdef CONFIG_CRASH_DUMP
+	unsigned long long crash_base, crash_size;
+	phys_addr_t low, high;
+	int rc;
+
+	rc = parse_crashkernel(boot_command_line, ident_map_size,
+			       &crash_size, &crash_base, NULL, NULL, NULL);
+
+	crash_base = ALIGN(crash_base, KEXEC_CRASH_MEM_ALIGN);
+	crash_size = ALIGN(crash_size, KEXEC_CRASH_MEM_ALIGN);
+	if (rc || crash_size == 0)
+		return;
+
+	if (memblock.memory.regions[0].size < crash_size) {
+		pr_info("crashkernel reservation failed: %s\n",
+			"first memory chunk must be at least crashkernel size");
+		return;
+	}
+
+	low = crash_base ?: oldmem_data.start;
+	high = low + crash_size;
+	if (low >= oldmem_data.start && high <= oldmem_data.start + oldmem_data.size) {
+		/* The crashkernel fits into OLDMEM, reuse OLDMEM */
+		crash_base = low;
+	} else {
+		/* Find suitable area in free memory */
+		low = max_t(unsigned long, crash_size, sclp.hsa_size);
+		high = crash_base ? crash_base + crash_size : ULONG_MAX;
+
+		if (crash_base && crash_base < low) {
+			pr_info("crashkernel reservation failed: %s\n",
+				"crash_base too low");
+			return;
+		}
+		low = crash_base ?: low;
+		crash_base = memblock_phys_alloc_range(crash_size,
+						       KEXEC_CRASH_MEM_ALIGN,
+						       low, high);
+	}
+
+	if (!crash_base) {
+		pr_info("crashkernel reservation failed: %s\n",
+			"no suitable area found");
+		return;
+	}
+
+	if (register_memory_notifier(&kdump_mem_nb)) {
+		memblock_phys_free(crash_base, crash_size);
+		return;
+	}
+
+	if (!oldmem_data.start && machine_is_vm())
+		diag10_range(PFN_DOWN(crash_base), PFN_DOWN(crash_size));
+	crashk_res.start = crash_base;
+	crashk_res.end = crash_base + crash_size - 1;
+	memblock_remove(crash_base, crash_size);
+	pr_info("Reserving %lluMB of memory at %lluMB "
+		"for crashkernel (System RAM: %luMB)\n",
+		crash_size >> 20, crash_base >> 20,
+		(unsigned long)memblock.memory.total_size >> 20);
+	os_info_crashkernel_add(crash_base, crash_size);
+#endif
+}
+
+/*
+ * Reserve the initrd from being used by memblock
+ */
+static void __init reserve_initrd(void)
+{
+	unsigned long addr, size;
+
+	if (!IS_ENABLED(CONFIG_BLK_DEV_INITRD) || !get_physmem_reserved(RR_INITRD, &addr, &size))
+		return;
+	initrd_start = (unsigned long)__va(addr);
+	initrd_end = initrd_start + size;
+	memblock_reserve(addr, size);
+}
+
+/*
+ * Reserve the memory area used to pass the certificate lists
+ */
+static void __init reserve_certificate_list(void)
+{
+	if (ipl_cert_list_addr)
+		memblock_reserve(ipl_cert_list_addr, ipl_cert_list_size);
+}
+
+static void __init reserve_physmem_info(void)
+{
+	unsigned long addr, size;
+
+	if (get_physmem_reserved(RR_MEM_DETECT_EXT, &addr, &size))
+		memblock_reserve(addr, size);
+}
+
+static void __init free_physmem_info(void)
+{
+	unsigned long addr, size;
+
+	if (get_physmem_reserved(RR_MEM_DETECT_EXT, &addr, &size))
+		memblock_phys_free(addr, size);
+}
+
+static void __init memblock_add_physmem_info(void)
+{
+	unsigned long start, end;
+	int i;
+
+	pr_debug("physmem info source: %s (%hhd)\n",
+		 get_physmem_info_source(), physmem_info.info_source);
+	/* keep memblock lists close to the kernel */
+	memblock_set_bottom_up(true);
+	for_each_physmem_usable_range(i, &start, &end)
+		memblock_add(start, end - start);
+	for_each_physmem_online_range(i, &start, &end)
+		memblock_physmem_add(start, end - start);
+	memblock_set_bottom_up(false);
+	memblock_set_node(0, ULONG_MAX, &memblock.memory, 0);
+}
+
+/*
+ * Reserve memory used for lowcore.
+ */
+static void __init reserve_lowcore(void)
+{
+	void *lowcore_start = get_lowcore();
+	void *lowcore_end = lowcore_start + sizeof(struct lowcore);
+	void *start, *end;
+
+	if (absolute_pointer(__identity_base) < lowcore_end) {
+		start = max(lowcore_start, (void *)__identity_base);
+		end = min(lowcore_end, (void *)(__identity_base + ident_map_size));
+		memblock_reserve(__pa(start), __pa(end));
+	}
+}
+
+/*
+ * Reserve memory used for absolute lowcore/command line/kernel image.
+ */
+static void __init reserve_kernel(void)
+{
+	memblock_reserve(0, STARTUP_NORMAL_OFFSET);
+	memblock_reserve(OLDMEM_BASE, sizeof(unsigned long));
+	memblock_reserve(OLDMEM_SIZE, sizeof(unsigned long));
+	memblock_reserve(physmem_info.reserved[RR_AMODE31].start, __eamode31 - __samode31);
+	memblock_reserve(__pa(sclp_early_sccb), EXT_SCCB_READ_SCP);
+	memblock_reserve(__pa(_stext), _end - _stext);
+}
+
+static void __init setup_memory(void)
+{
+	phys_addr_t start, end;
+	u64 i;
+
+	/*
+	 * Init storage key for present memory
+	 */
+	for_each_mem_range(i, &start, &end)
+		storage_key_init_range(start, end);
+
+	psw_set_key(PAGE_DEFAULT_KEY);
+}
+
+static void __init relocate_amode31_section(void)
+{
+	unsigned long amode31_size = __eamode31 - __samode31;
+	long amode31_offset, *ptr;
+
+	amode31_offset = AMODE31_START - (unsigned long)__samode31;
+	pr_info("Relocating AMODE31 section of size 0x%08lx\n", amode31_size);
+
+	/* Move original AMODE31 section to the new one */
+	memmove((void *)physmem_info.reserved[RR_AMODE31].start, __samode31, amode31_size);
+	/* Zero out the old AMODE31 section to catch invalid accesses within it */
+	memset(__samode31, 0, amode31_size);
+
+	/* Update all AMODE31 region references */
+	for (ptr = _start_amode31_refs; ptr != _end_amode31_refs; ptr++)
+		*ptr += amode31_offset;
+}
+
+/* This must be called after AMODE31 relocation */
+static void __init setup_cr(void)
+{
+	union ctlreg2 cr2;
+	union ctlreg5 cr5;
+	union ctlreg15 cr15;
+
+	__ctl_duct[1] = (unsigned long)__ctl_aste;
+	__ctl_duct[2] = (unsigned long)__ctl_aste;
+	__ctl_duct[4] = (unsigned long)__ctl_duald;
+
+	/* Update control registers CR2, CR5 and CR15 */
+	local_ctl_store(2, &cr2.reg);
+	local_ctl_store(5, &cr5.reg);
+	local_ctl_store(15, &cr15.reg);
+	cr2.ducto = (unsigned long)__ctl_duct >> 6;
+	cr5.pasteo = (unsigned long)__ctl_duct >> 6;
+	cr15.lsea = (unsigned long)__ctl_linkage_stack >> 3;
+	system_ctl_load(2, &cr2.reg);
+	system_ctl_load(5, &cr5.reg);
+	system_ctl_load(15, &cr15.reg);
+}
+
+/*
+ * Add system information as device randomness
+ */
+static void __init setup_randomness(void)
+{
+	struct sysinfo_3_2_2 *vmms;
+
+	vmms = memblock_alloc_or_panic(PAGE_SIZE, PAGE_SIZE);
+	if (stsi(vmms, 3, 2, 2) == 0 && vmms->count)
+		add_device_randomness(&vmms->vm, sizeof(vmms->vm[0]) * vmms->count);
+	memblock_free(vmms, PAGE_SIZE);
+
+	if (cpacf_query_func(CPACF_PRNO, CPACF_PRNO_TRNG))
+		static_branch_enable(&s390_arch_random_available);
+}
+
+/*
+ * Issue diagnose 318 to set the control program name and
+ * version codes.
+ */
+static void __init setup_control_program_code(void)
+{
+	union diag318_info diag318_info = {
+		.cpnc = CPNC_LINUX,
+		.cpvc = 0,
+	};
+
+	if (!sclp.has_diag318)
+		return;
+
+	diag_stat_inc(DIAG_STAT_X318);
+	asm volatile("diag %0,0,0x318\n" : : "d" (diag318_info.val));
+}
+
+/*
+ * Print the component list from the IPL report
+ */
+static void __init log_component_list(void)
+{
+	struct ipl_rb_component_entry *ptr, *end;
+	char *str;
+
+	if (!early_ipl_comp_list_addr)
+		return;
+	if (ipl_block.hdr.flags & IPL_PL_FLAG_SIPL)
+		pr_info("Linux is running with Secure-IPL enabled\n");
+	else
+		pr_info("Linux is running with Secure-IPL disabled\n");
+	ptr = __va(early_ipl_comp_list_addr);
+	end = (void *) ptr + early_ipl_comp_list_size;
+	pr_info("The IPL report contains the following components:\n");
+	while (ptr < end) {
+		if (ptr->flags & IPL_RB_COMPONENT_FLAG_SIGNED) {
+			if (ptr->flags & IPL_RB_COMPONENT_FLAG_VERIFIED)
+				str = "signed, verified";
+			else
+				str = "signed, verification failed";
+		} else {
+			str = "not signed";
+		}
+		pr_info("%016llx - %016llx (%s)\n",
+			ptr->addr, ptr->addr + ptr->len, str);
+		ptr++;
+	}
+}
+
+/*
+ * Print avoiding interpretation of % in buf and taking bootdebug option
+ * into consideration.
+ */
+static void __init print_rb_entry(const char *buf)
+{
+	char fmt[] = KERN_SOH "0boot: %s";
+	int level = printk_get_level(buf);
+
+	buf = skip_timestamp(printk_skip_level(buf));
+	if (level == KERN_DEBUG[1] && (!bootdebug || !bootdebug_filter_match(buf)))
+		return;
+
+	fmt[1] = level;
+	printk(fmt, buf);
+}
+
+/*
+ * Setup function called from init/main.c just after the banner
+ * was printed.
+ */
+
+void __init setup_arch(char **cmdline_p)
+{
+        /*
+         * print what head.S has found out about the machine
+         */
+	if (machine_is_vm())
+		pr_info("Linux is running as a z/VM "
+			"guest operating system in 64-bit mode\n");
+	else if (machine_is_kvm())
+		pr_info("Linux is running under KVM in 64-bit mode\n");
+	else if (machine_is_lpar())
+		pr_info("Linux is running natively in 64-bit mode\n");
+	else
+		pr_info("Linux is running as a guest in 64-bit mode\n");
+	/* Print decompressor messages if not already printed */
+	if (!boot_earlyprintk)
+		boot_rb_foreach(print_rb_entry);
+
+	if (machine_has_relocated_lowcore())
+		pr_info("Lowcore relocated to 0x%px\n", get_lowcore());
+
+	log_component_list();
+
+	/* Have one command line that is parsed and saved in /proc/cmdline */
+	/* boot_command_line has been already set up in early.c */
+	*cmdline_p = boot_command_line;
+
+        ROOT_DEV = Root_RAM0;
+
+	setup_initial_init_mm(_text, _etext, _edata, _end);
+
+	if (IS_ENABLED(CONFIG_EXPOLINE_AUTO))
+		nospec_auto_detect();
+
+	jump_label_init();
+	parse_early_param();
+#ifdef CONFIG_CRASH_DUMP
+	/* Deactivate elfcorehdr= kernel parameter */
+	elfcorehdr_addr = ELFCORE_ADDR_MAX;
+#endif
+
+	os_info_init();
+	setup_ipl();
+	setup_control_program_code();
+
+	/* Do some memory reservations *before* memory is added to memblock */
+	reserve_pgtables();
+	reserve_lowcore();
+	reserve_kernel();
+	reserve_initrd();
+	reserve_certificate_list();
+	reserve_physmem_info();
+	memblock_set_current_limit(ident_map_size);
+	memblock_allow_resize();
+
+	/* Get information about *all* installed memory */
+	memblock_add_physmem_info();
+
+	free_physmem_info();
+	setup_memory_end();
+	memblock_dump_all();
+	setup_memory();
+
+	relocate_amode31_section();
+	setup_cr();
+	setup_uv();
+	dma_contiguous_reserve(ident_map_size);
+	vmcp_cma_reserve();
+	if (cpu_has_edat2())
+		hugetlb_cma_reserve(PUD_SHIFT - PAGE_SHIFT);
+
+	reserve_crashkernel();
+#ifdef CONFIG_CRASH_DUMP
+	/*
+	 * Be aware that smp_save_dump_secondary_cpus() triggers a system reset.
+	 * Therefore CPU and device initialization should be done afterwards.
+	 */
+	smp_save_dump_secondary_cpus();
+#endif
+
+	setup_resources();
+	setup_lowcore();
+	smp_fill_possible_mask();
+	cpu_detect_mhz_feature();
+        cpu_init();
+	numa_setup();
+	smp_detect_cpus();
+	topology_init_early();
+	setup_protection_map();
+	/*
+	 * Create kernel page tables.
+	 */
+        paging_init();
+
+
+#ifdef CONFIG_CRASH_DUMP
+	smp_save_dump_ipl_cpu();
+#endif
+
+        /* Setup default console */
+	conmode_default();
+	set_preferred_console();
+
+	apply_alternative_instructions();
+	if (IS_ENABLED(CONFIG_EXPOLINE))
+		nospec_init_branches();
+
+	/* Setup zfcp/nvme dump support */
+	setup_zfcpdump();
+
+	/* Add system specific data to the random pool */
+	setup_randomness();
+}
+
+void __init arch_cpu_finalize_init(void)
+{
+	sclp_init();
+}
+
 
 //WTBD////
 /* Soon */

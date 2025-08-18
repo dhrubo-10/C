@@ -1,3 +1,5 @@
+/* system .sys to calculate buffer strings on terminal*/
+
 #include <linux/kgdb.h>
 #include <linux/sched.h>
 #include <linux/sched/task_stack.h>
@@ -16,7 +18,7 @@ static void to_gdb_regs(unsigned long *gdb_regs, struct pt_regs *kernel_regs,
 		gdb_regs[regno] = 0;
 
 	gdb_regs[_FP]		= kernel_regs->fp;
-	gdb_regs[__SP]		= kernel_regs->sp;
+	gdb_regson[__SP]		= kernel_regs->sp;
 	gdb_regs[_BLINK]	= kernel_regs->blink;
 	gdb_regs[_RET]		= kernel_regs->ret;
 	gdb_regs[_STATUS32]	= kernel_regs->status32;

@@ -1604,7 +1604,7 @@ static struct notifier_block kdump_mem_nb = {
 #endif
 
 /*
- * Reserve page tables created by decompressor
+ Reserve page tables created by decompressor
  */
 static void __init reserve_pgtables(void)
 {
@@ -1616,7 +1616,7 @@ static void __init reserve_pgtables(void)
 }
 
 /*
- * Reserve memory for kdump kernel to be loaded with kexec
+ Reserve memory for kdump kernel to be loaded with kexec
  */
 static void __init reserve_crashkernel(void)
 {
@@ -1685,7 +1685,7 @@ static void __init reserve_crashkernel(void)
 }
 
 /*
- * Reserve the initrd from being used by memblock
+ Reserve the initrd from being used by memblock
  */
 static void __init reserve_initrd(void)
 {
@@ -1699,7 +1699,7 @@ static void __init reserve_initrd(void)
 }
 
 /*
- * Reserve the memory area used to pass the certificate lists
+ Reserve the memory area used to pass the certificate lists
  */
 static void __init reserve_certificate_list(void)
 {
@@ -1741,7 +1741,7 @@ static void __init memblock_add_physmem_info(void)
 }
 
 /*
- * Reserve memory used for lowcore.
+  Reserve memory used for lowcore.
  */
 static void __init reserve_lowcore(void)
 {
@@ -1757,7 +1757,7 @@ static void __init reserve_lowcore(void)
 }
 
 /*
- * Reserve memory used for absolute lowcore/command line/kernel image.
+ Reserve memory used for absolute lowcore/command line/kernel image.
  */
 static void __init reserve_kernel(void)
 {
@@ -1774,9 +1774,7 @@ static void __init setup_memory(void)
 	phys_addr_t start, end;
 	u64 i;
 
-	/*
-	 * Init storage key for present memory
-	 */
+
 	for_each_mem_range(i, &start, &end)
 		storage_key_init_range(start, end);
 
@@ -1791,17 +1789,16 @@ static void __init relocate_amode31_section(void)
 	amode31_offset = AMODE31_START - (unsigned long)__samode31;
 	pr_info("Relocating AMODE31 section of size 0x%08lx\n", amode31_size);
 
-	/* Move original AMODE31 section to the new one */
+	
 	memmove((void *)physmem_info.reserved[RR_AMODE31].start, __samode31, amode31_size);
-	/* Zero out the old AMODE31 section to catch invalid accesses within it */
+
 	memset(__samode31, 0, amode31_size);
 
-	/* Update all AMODE31 region references */
+
 	for (ptr = _start_amode31_refs; ptr != _end_amode31_refs; ptr++)
 		*ptr += amode31_offset;
 }
 
-/* This must be called after AMODE31 relocation */
 static void __init setup_cr(void)
 {
 	union ctlreg2 cr2;
@@ -1812,7 +1809,7 @@ static void __init setup_cr(void)
 	__ctl_duct[2] = (unsigned long)__ctl_aste;
 	__ctl_duct[4] = (unsigned long)__ctl_duald;
 
-	/* Update control registers CR2, CR5 and CR15 */
+	
 	local_ctl_store(2, &cr2.reg);
 	local_ctl_store(5, &cr5.reg);
 	local_ctl_store(15, &cr15.reg);
@@ -1824,9 +1821,7 @@ static void __init setup_cr(void)
 	system_ctl_load(15, &cr15.reg);
 }
 
-/*
- * Add system information as device randomness
- */
+
 static void __init setup_randomness(void)
 {
 	struct sysinfo_3_2_2 *vmms;
@@ -1840,10 +1835,7 @@ static void __init setup_randomness(void)
 		static_branch_enable(&s390_arch_random_available);
 }
 
-/*
- * Issue diagnose 318 to set the control program name and
- * version codes.
- */
+/
 static void __init setup_control_program_code(void)
 {
 	union diag318_info diag318_info = {
@@ -1858,9 +1850,7 @@ static void __init setup_control_program_code(void)
 	asm volatile("diag %0,0,0x318\n" : : "d" (diag318_info.val));
 }
 
-/*
- * Print the component list from the IPL report
- */
+
 static void __init log_component_list(void)
 {
 	struct ipl_rb_component_entry *ptr, *end;
@@ -1890,10 +1880,7 @@ static void __init log_component_list(void)
 	}
 }
 
-/*
- * Print avoiding interpretation of % in buf and taking bootdebug option
- * into consideration.
- */
+
 static void __init print_rb_entry(const char *buf)
 {
 	char fmt[] = KERN_SOH "0boot: %s";
@@ -1907,16 +1894,11 @@ static void __init print_rb_entry(const char *buf)
 	printk(fmt, buf);
 }
 
-/*
- * Setup function called from init/main.c just after the banner
- * was printed.
- */
+
 
 void __init setup_arch(char **cmdline_p)
 {
-        /*
-         * print what head.S has found out about the machine
-         */
+
 	if (machine_is_vm())
 		pr_info("Linux is running as a z/VM "
 			"guest operating system in 64-bit mode\n");
@@ -1957,8 +1939,6 @@ void __init setup_arch(char **cmdline_p)
 	setup_ipl();
 	setup_control_program_code();
 
-	/* Do some memory reservations *before* memory is added to memblock */
-	reserve_pgtables();
 	reserve_lowcore();
 	reserve_kernel();
 	reserve_initrd();
@@ -1967,7 +1947,7 @@ void __init setup_arch(char **cmdline_p)
 	memblock_set_current_limit(ident_map_size);
 	memblock_allow_resize();
 
-	/* Get information about *all* installed memory */
+
 	memblock_add_physmem_info();
 
 	free_physmem_info();
@@ -1985,10 +1965,7 @@ void __init setup_arch(char **cmdline_p)
 
 	reserve_crashkernel();
 #ifdef CONFIG_CRASH_DUMP
-	/*
-	 * Be aware that smp_save_dump_secondary_cpus() triggers a system reset.
-	 * Therefore CPU and device initialization should be done afterwards.
-	 */
+
 	smp_save_dump_secondary_cpus();
 #endif
 
@@ -2001,9 +1978,7 @@ void __init setup_arch(char **cmdline_p)
 	smp_detect_cpus();
 	topology_init_early();
 	setup_protection_map();
-	/*
-	 * Create kernel page tables.
-	 */
+
         paging_init();
 
 
@@ -2011,7 +1986,7 @@ void __init setup_arch(char **cmdline_p)
 	smp_save_dump_ipl_cpu();
 #endif
 
-        /* Setup default console */
+
 	conmode_default();
 	set_preferred_console();
 
@@ -2019,16 +1994,206 @@ void __init setup_arch(char **cmdline_p)
 	if (IS_ENABLED(CONFIG_EXPOLINE))
 		nospec_init_branches();
 
-	/* Setup zfcp/nvme dump support */
+
 	setup_zfcpdump();
 
-	/* Add system specific data to the random pool */
+
 	setup_randomness();
 }
 
 void __init arch_cpu_finalize_init(void)
 {
 	sclp_init();
+}
+
+int __init_or_module do_one_initcall(initcall_t fn)
+{
+	int count = preempt_count();
+	char msgbuf[64];
+	int ret;
+
+	if (initcall_blacklisted(fn))
+		return -EPERM;
+
+	do_trace_initcall_start(fn);
+	ret = fn();
+	do_trace_initcall_finish(fn, ret);
+
+	msgbuf[0] = 0;
+
+	if (preempt_count() != count) {
+		sprintf(msgbuf, "preemption imbalance ");
+		preempt_count_set(count);
+	}
+	if (irqs_disabled()) {
+		strlcat(msgbuf, "disabled interrupts ", sizeof(msgbuf));
+		local_irq_enable();
+	}
+	WARN(msgbuf[0], "initcall %pS returned with %s\n", fn, msgbuf);
+
+	add_latent_entropy();
+	return ret;
+}
+
+
+static initcall_entry_t *initcall_levels[] __initdata = {
+	__initcall0_start,
+	__initcall1_start,
+	__initcall2_start,
+	__initcall3_start,
+	__initcall4_start,
+	__initcall5_start,
+	__initcall6_start,
+	__initcall7_start,
+	__initcall_end,
+};
+
+static const char *initcall_level_names[] __initdata = {
+	"pure",
+	"core",
+	"postcore",
+	"arch",
+	"subsys",
+	"fs",
+	"device",
+	"late",
+};
+
+static int __init ignore_unknown_bootoption(char *param, char *val,
+			       const char *unused, void *arg)
+{
+	return 0;
+}
+
+static void __init do_initcall_level(int level, char *command_line)
+{
+	initcall_entry_t *fn;
+
+	parse_args(initcall_level_names[level],
+		   command_line, __start___param,
+		   __stop___param - __start___param,
+		   level, level,
+		   NULL, ignore_unknown_bootoption);
+
+	do_trace_initcall_level(initcall_level_names[level]);
+	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
+		do_one_initcall(initcall_from_entry(fn));
+}
+
+static void __init do_initcalls(void)
+{
+	int level;
+	size_t len = saved_command_line_len + 1;
+	char *command_line;
+
+	command_line = kzalloc(len, GFP_KERNEL);
+	if (!command_line)
+		panic("%s: Failed to allocate %zu bytes\n", __func__, len);
+
+	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++) {
+		/* Parser modifies command_line, restore it each time */
+		strcpy(command_line, saved_command_line);
+		do_initcall_level(level, command_line);
+	}
+
+	kfree(command_line);
+}
+
+/*
+ Ok, the machine is now initialized. None of the devices
+ have been touched yet, but the CPU subsystem is up and
+ running, and memory and process management works.
+ 
+ Now we can finally start doing some real work..
+ */
+static void __init do_basic_setup(void)
+{
+	cpuset_init_smp();
+	driver_init();
+	init_irq_proc();
+	do_ctors();
+	do_initcalls();
+}
+
+static void __init do_pre_smp_initcalls(void)
+{
+	initcall_entry_t *fn;
+
+	do_trace_initcall_level("early");
+	for (fn = __initcall_start; fn < __initcall0_start; fn++)
+		do_one_initcall(initcall_from_entry(fn));
+}
+
+static int run_init_process(const char *init_filename)
+{
+	const char *const *p;
+
+	argv_init[0] = init_filename;
+	pr_info("Run %s as init process\n", init_filename);
+	pr_debug("  with arguments:\n");
+	for (p = argv_init; *p; p++)
+		pr_debug("    %s\n", *p);
+	pr_debug("  with environment:\n");
+	for (p = envp_init; *p; p++)
+		pr_debug("    %s\n", *p);
+	return kernel_execve(init_filename, argv_init, envp_init);
+}
+
+static int try_to_run_init_process(const char *init_filename)
+{
+	int ret;
+
+	ret = run_init_process(init_filename);
+
+	if (ret && ret != -ENOENT) {
+		pr_err("Starting init: %s exists but couldn't execute it (error %d)\n",
+		       init_filename, ret);
+	}
+
+	return ret;
+}
+
+static noinline void __init kernel_init_freeable(void);
+
+#if defined(CONFIG_STRICT_KERNEL_RWX) || defined(CONFIG_STRICT_MODULE_RWX)
+bool rodata_enabled __ro_after_init = true;
+
+#ifndef arch_parse_debug_rodata
+static inline bool arch_parse_debug_rodata(char *str) { return false; }
+#endif
+
+static int __init set_debug_rodata(char *str)
+{
+	if (arch_parse_debug_rodata(str))
+		return 0;
+
+	if (str && !strcmp(str, "on"))
+		rodata_enabled = true;
+	else if (str && !strcmp(str, "off"))
+		rodata_enabled = false;
+	else
+		pr_warn("Invalid option string for rodata: '%s'\n", str);
+	return 0;
+}
+early_param("rodata", set_debug_rodata);
+#endif
+
+static void mark_readonly(void)
+{
+	if (IS_ENABLED(CONFIG_STRICT_KERNEL_RWX) && rodata_enabled) {
+
+		flush_module_init_free_work();
+		jump_label_init_ro();
+		mark_rodata_ro();
+		debug_checkwx();
+		rodata_test();
+	} else if (IS_ENABLED(CONFIG_STRICT_KERNEL_RWX)) {
+		pr_info("Kernel memory protection disabled.\n");
+	} else if (IS_ENABLED(CONFIG_ARCH_HAS_STRICT_KERNEL_RWX)) {
+		pr_warn("Kernel memory protection not selected by kernel config.\n");
+	} else {
+		pr_warn("This architecture does not have kernel memory protection.\n");
+	}
 }
 
 

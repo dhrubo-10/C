@@ -15,6 +15,10 @@
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/unaligned.h>
+#include <linux/cpu.h>
+#include <linux/err.h>
+#include <linux/smp.h>
+#include <linux/delay.h>
 
 // main
 // This section is still under progress
@@ -64,6 +68,22 @@ static int __init initcall_blacklist(char *str)
 	} while (str_entry);
 
 	return 1;
+}
+
+static DEFINE_PER_CPU(struct task_struct *, idle_threads);
+
+struct task_struct *idle_thread_get(unsigned int cpu)
+{
+	struct task_struct *tsk = per_cpu(idle_threads, cpu);
+
+	if (!tsk)
+		return ERR_PTR(-ENOMEM);
+	return tsk;
+}
+
+void __init idle_thread_set_boot_cpu(void)
+{
+	per_cpu(idle_threads, smp_processor_id()) = current;
 }
 
 static bool __init_or_module initcall_blacklisted(initcall_t fn)
@@ -310,10 +330,17 @@ static __init int kernel_do_mounts_initrd_sysctls_init(void)
 late_initcall(kernel_do_mounts_initrd_sysctls_init);
 #endif /* CONFIG_SYSCTL */
 
-static int __init no_initrd(char *str)
+static __always_inline void idle_init(unsigned int cpu)
 {
-	mount_initrd = 0;
-	return 1;
+	struct task_struct *tsk = per_cpu(idle_threads, cpu);
+
+	if (!tsk) {
+		tsk = fork_idle(cpu);
+		if (IS_ERR(tsk))
+			pr_err("SMP: fork_idle() failed for CPU %u\n", cpu);
+		else
+			per_cpu(idle_threads, cpu) = tsk;
+	}
 }
 
 __setup("noinitrd", no_initrd);
@@ -419,7 +446,20 @@ bool __init initrd_load(char *root_device_name)
 	return false;
 }
 
+static LIST_HEAD(hotplug_threads);
+static DEFINE_MUTEX(smpboot_threads_lock);
 
+struct smpboot_thread_data {
+	unsigned int			cpu;
+	unsigned int			status;
+	struct smp_hotplug_thread	*ht;
+};
+
+enum {
+	HP_THREAD_NONE = 0,
+	HP_THREAD_ACTIVE,
+	HP_THREAD_PARKED,
+};
 
 static void __init initramfs_test_csum(struct kunit *test)
 {
@@ -610,6 +650,31 @@ static __init_or_module void
 trace_initcall_level_cb(void *data, const char *level)
 {
 	printk(KERN_DEBUG "entering initcall level: %s\n", level);
+
+	while (1) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		preempt_disable();
+		if (kthread_should_stop()) {
+			__set_current_state(TASK_RUNNING);
+			preempt_enable();
+			/* cleanup must mirror setup */
+			if (ht->cleanup && td->status != HP_THREAD_NONE)
+				ht->cleanup(td->cpu, cpu_online(td->cpu));
+			kfree(td);
+			return 0;
+		}
+
+		if (kthread_should_park()) {
+			__set_current_state(TASK_RUNNING);
+			preempt_enable();
+			if (ht->park && td->status == HP_THREAD_ACTIVE) {
+				BUG_ON(td->cpu != smp_processor_id());
+				ht->park(td->cpu);
+				td->status = HP_THREAD_PARKED;
+			}
+			kthread_parkme();
+			continue;
+		}
 }
 
 static ktime_t initcall_calltime;
@@ -762,7 +827,20 @@ static int __init root_data_setup(char *str)
 	root_mount_data = str;
 	return 1;
 }
+int smpboot_create_threads(unsigned int cpu)
+{
+	struct smp_hotplug_thread *cur;
+	int ret = 0;
 
+	mutex_lock(&smpboot_threads_lock);
+	list_for_each_entry(cur, &hotplug_threads, list) {
+		ret = __smpboot_create_thread(cur, cpu);
+		if (ret)
+			break;
+	}
+	mutex_unlock(&smpboot_threads_lock);
+	return ret;
+}
 static char * __initdata root_fs_names;
 static int __init fs_names_setup(char *str)
 {
@@ -1721,7 +1799,28 @@ static void __init free_physmem_info(void)
 
 	if (get_physmem_reserved(RR_MEM_DETECT_EXT, &addr, &size))
 		memblock_phys_free(addr, size);
+
+	unsigned int cpu;
+	int ret = 0;
+
+	cpus_read_lock();
+	mutex_lock(&smpboot_threads_lock);
+	for_each_online_cpu(cpu) {
+		ret = __smpboot_create_thread(plug_thread, cpu);
+		if (ret) {
+			smpboot_destroy_threads(plug_thread);
+			goto out;
+		}
+		smpboot_unpark_thread(plug_thread, cpu);
+	}
+	list_add(&plug_thread->list, &hotplug_threads);
+	out:
+		mutex_unlock(&smpboot_threads_lock);
+		cpus_read_unlock();
+		return ret;
 }
+
+EXPORT_SYMBOL_GPL(smpboot_register_percpu_thread);
 
 static void __init memblock_add_physmem_info(void)
 {
@@ -2195,6 +2294,17 @@ static void mark_readonly(void)
 		pr_warn("This architecture does not have kernel memory protection.\n");
 	}
 }
+
+void smpboot_unregister_percpu_thread(struct smp_hotplug_thread *plug_thread)
+{
+	cpus_read_lock();
+	mutex_lock(&smpboot_threads_lock);
+	list_del(&plug_thread->list);
+	smpboot_destroy_threads(plug_thread);
+	mutex_unlock(&smpboot_threads_lock);
+	cpus_read_unlock();
+}
+EXPORT_SYMBOL_GPL(smpboot_unregister_percpu_thread);
 
 
 //WTBD////

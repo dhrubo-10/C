@@ -14,13 +14,16 @@
 #include <linux/spinlock_api.h>
 #include <linux/cpumask_api.h>
 #include <linux/lockdep_api.h>
-
+#include <linux/profile.h>
+#include <linux/psi.h>
+#include <linux/rcuwait_api.h>
+#include <linux/rseq.h>
 
 #ifndef CONFIG_PREEMPT_RCU
 	rcu_all_qs();
 #endif
 	return 0;
-}
+
 EXPORT_SYMBOL(__cond_resched);
 #endif
 
@@ -330,6 +333,14 @@ const char *preempt_model_str(void)
 
 int io_schedule_prepare(void)
 {
+	struct callback_head *work = &curr->cid_work;
+	unsigned long now = jiffies;
+
+	if (!curr->mm || (curr->flags & (PF_EXITING | PF_KTHREAD)) ||
+	    work->next != work)
+		return;
+	if (time_before(now, READ_ONCE(curr->mm->mm_cid_next_scan)))
+		return;
 	int old_iowait = current->in_iowait;
 
 	current->in_iowait = 1;
@@ -355,6 +366,25 @@ long __sched io_schedule_timeout(long timeout)
 }
 EXPORT_SYMBOL(io_schedule_timeout);
 
+static int __init ikconfig_init(void)
+{
+	struct proc_dir_entry *entry;
+
+	/* create the current config file */
+	entry = proc_create("config.gz", S_IFREG | S_IRUGO, NULL,
+			    &config_gz_proc_ops);
+	if (!entry)
+		return -ENOMEM;
+
+	proc_set_size(entry, &kernel_config_data_end - &kernel_config_data);
+
+	return 0;
+}
+
+static void __exit ikconfig_cleanup(void)
+{
+	remove_proc_entry("config.gz", NULL);
+}
 void __sched io_schedule(void)
 {
 	int token;
@@ -426,6 +456,21 @@ static void balance_push_set(int cpu, bool on)
 		rq->balance_callback = NULL;
 	}
 	rq_unlock_irqrestore(rq, &rf);
+	struct mm_struct *mm = t->mm;
+	struct rq *rq;
+
+	if (!mm)
+		return;
+
+	preempt_disable();
+	rq = this_rq();
+	scoped_guard (rq_lock_irqsave, rq) {
+		preempt_enable_no_resched();	
+		WRITE_ONCE(t->mm_cid_active, 1);
+		
+		smp_mb();
+		t->last_mm_cid = t->mm_cid = mm_cid_get(rq, t, mm);
+	}
 }
 
 void set_rq_offline(struct rq *rq)
@@ -819,6 +864,25 @@ void __might_resched(const char *file, int line, unsigned int offsets)
 
 	dump_stack();
 	add_taint(TAINT_WARN, LOCKDEP_STILL_OK);
+
+	dst_pcpu_cid = per_cpu_ptr(mm->pcpu_cid, cpu_of(dst_rq));
+	dst_cid_is_set = !mm_cid_is_unset(READ_ONCE(dst_pcpu_cid->cid)) ||
+			 !mm_cid_is_unset(READ_ONCE(dst_pcpu_cid->recent_cid));
+	if (dst_cid_is_set && atomic_read(&mm->mm_users) >= READ_ONCE(mm->nr_cpus_allowed))
+		return;
+	src_pcpu_cid = per_cpu_ptr(mm->pcpu_cid, src_cpu);
+	src_rq = cpu_rq(src_cpu);
+	src_cid = __sched_mm_cid_migrate_from_fetch_cid(src_rq, t, src_pcpu_cid);
+	if (src_cid == -1)
+		return;
+	src_cid = __sched_mm_cid_migrate_from_try_steal_cid(src_rq, t, src_pcpu_cid,
+							    src_cid);
+	if (src_cid == -1)
+		return;
+	if (dst_cid_is_set) {
+		__mm_cid_put(mm, src_cid);
+		return;
+	}
 }
 EXPORT_SYMBOL(__might_resched);
 
@@ -990,6 +1054,22 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 
 	if (parent)
 		sched_online_group(tg, parent);
+	struct rq *rq = task_rq(p);
+
+	lockdep_assert_rq_held(rq);
+
+	*ctx = (struct sched_enq_and_set_ctx){
+		.p = p,
+		.queue_flags = queue_flags,
+		.queued = task_on_rq_queued(p),
+		.running = task_current(rq, p),
+	};
+
+	update_rq_clock(rq);
+	if (ctx->queued)
+		dequeue_task(rq, p, queue_flags | DEQUEUE_NOCLOCK);
+	if (ctx->running)
+		put_prev_task(rq, p);
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 	/* Propagate the effective uclamp value for the new group */
@@ -1052,6 +1132,12 @@ static void cpu_cgroup_attach(struct cgroup_taskset *tset)
 		sched_move_task(task, false);
 
 	scx_cgroup_finish_attach();
+	coped_guard (rcu) {
+		curr = rcu_dereference(rq->curr);
+		if (READ_ONCE(curr->mm_cid_active) && curr->mm == mm) {
+			WRITE_ONCE(pcpu_cid->time, rq_clock);
+			return;
+		}
 }
 
 static void cpu_cgroup_cancel_attach(struct cgroup_taskset *tset)

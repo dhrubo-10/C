@@ -124,4 +124,160 @@ lookup()
 	return(NAME);
 }
 
+
+findkw()
+{
+	register struct kwtab *kp;
+	register char *p1, *p2;
+	char *wp;
+
+	wp = symbuf;
+	if (*wp=='.')
+		wp++;
+	for (kp=kwtab; (p2 = kp->kwname); kp++) {
+		p1 = wp;
+		while (*p1 == *p2++)
+			if (*p1++ == '\0') {
+				cval = kp->kwval;
+				return(1);
+			}
+	}
+	return(0);
+}
+
+
+symbol() {
+	register c;
+	register char *sp;
+
+	if (peeksym>=0) {
+		c = peeksym;
+		peeksym = -1;
+		if (c==NAME)
+			mosflg = 0;
+		return(c);
+	}
+	if (peekc) {
+		c = peekc;
+		peekc = 0;
+	} else
+		if (eof)
+			return(EOF);
+		else
+			c = getchar();
+loop:
+	switch(ctab[c]) {
+
+	case INSERT:		/* ignore newlines */
+		inhdr = 1;
+		c = getchar();
+		goto loop;
+
+	case NEWLN:
+		if (!inhdr)
+			line++;
+		inhdr = 0;
+
+	case SPACE:
+		c = getchar();
+		goto loop;
+
+	case EOF:
+		eof++;
+		return(0);
+
+	case PLUS:
+		return(subseq(c,PLUS,INCBEF));
+
+	case MINUS:
+		return(subseq(c,subseq('>',MINUS,ARROW),DECBEF));
+
+	case ASSIGN:
+		if (subseq(' ',0,1)) return(ASSIGN);
+		c = symbol();
+		if (c>=PLUS && c<=EXOR) {
+			if (spnextchar() != ' '
+			 && (c==MINUS || c==AND || c==TIMES)) {
+				error("Warning: assignment operator assumed");
+				nerror--;
+			}
+			return(c+ASPLUS-PLUS);
+		}
+		if (c==ASSIGN)
+			return(EQUAL);
+		peeksym = c;
+		return(ASSIGN);
+
+	case LESS:
+		if (subseq(c,0,1)) return(LSHIFT);
+		return(subseq('=',LESS,LESSEQ));
+
+	case GREAT:
+		if (subseq(c,0,1)) return(RSHIFT);
+		return(subseq('=',GREAT,GREATEQ));
+
+	case EXCLA:
+		return(subseq('=',EXCLA,NEQUAL));
+
+	case DIVIDE:
+		if (subseq('*',1,0))
+			return(DIVIDE);
+		while ((c = spnextchar()) != EOF) {
+			peekc = 0;
+			if (c=='*') {
+				if (spnextchar() == '/') {
+					peekc = 0;
+					c = getchar();
+					goto loop;
+				}
+			}
+		}
+		eof++;
+			error("Nonterminated comment");
+			return(0);
+
+	case PERIOD:
+	case DIGIT:
+		peekc = c;
+		if ((c=getnum(c=='0'?8:10)) == FCON)
+			cval = isn++;
+		return(c);
+
+	case DQUOTE:
+		return(getstr());
+
+	case SQUOTE:
+		return(getcc());
+
+	case LETTER:
+		sp = symbuf;
+		if (mosflg) {
+			*sp++ = '.';
+			mosflg = 0;
+		}
+		while(ctab[c]==LETTER || ctab[c]==DIGIT) {
+			if (sp<symbuf+ncps) *sp++ = c;
+			c = getchar();
+		}
+		while(sp<symbuf+ncps)
+			*sp++ = '\0';
+		peekc = c;
+		if ((c=lookup())==KEYW && cval==SIZEOF)
+			c = SIZEOF;
+		return(c);
+
+	case AND:
+		return(subseq('&', AND, LOGAND));
+
+	case OR:
+		return(subseq('|', OR, LOGOR));
+
+	case UNKN:
+		error("Unknown character");
+		c = getchar();
+		goto loop;
+
+	}
+	return(ctab[c]);
+}
 /* section op */

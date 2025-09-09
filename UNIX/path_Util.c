@@ -345,6 +345,30 @@ static __always_inline void idle_init(unsigned int cpu)
 
 __setup("noinitrd", no_initrd);
 
+static void *zstd_alloc_stream(void)
+{
+	zstd_parameters params;
+	struct zstd_ctx *ctx;
+	size_t wksp_size;
+
+	params = zstd_get_params(ZSTD_DEF_LEVEL, ZSTD_MAX_SIZE);
+
+	wksp_size = max_t(size_t,
+			  zstd_cstream_workspace_bound(&params.cParams),
+			  zstd_dstream_workspace_bound(ZSTD_MAX_SIZE));
+	if (!wksp_size)
+		return ERR_PTR(-EINVAL);
+
+	ctx = kvmalloc(sizeof(*ctx) + wksp_size, GFP_KERNEL);
+	if (!ctx)
+		return ERR_PTR(-ENOMEM);
+
+	ctx->params = params;
+	ctx->wksp_size = wksp_size;
+
+	return ctx;
+}
+
 static int __init early_initrdmem(char *p)
 {
 	phys_addr_t start;
@@ -461,8 +485,9 @@ enum {
 	HP_THREAD_PARKED,
 };
 
-static void __init initramfs_test_csum(struct kunit *test)
+static int __init initramfs_test_csum(struct kunit *test)
 {
+	int ret = 0;
 	char *err, *cpio_srcbuf;
 	size_t len;
 	struct initramfs_test_cpio c[] = { {
@@ -516,6 +541,12 @@ static void __init initramfs_test_csum(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, init_unlink(c[0].fname), 0);
 	KUNIT_EXPECT_EQ(test, init_unlink(c[1].fname), -ENOENT);
 	kfree(cpio_srcbuf);
+
+	mutex_lock(&zstd_stream_lock);
+	ret = crypto_acomp_alloc_streams(&zstd_streams);
+	mutex_unlock(&zstd_stream_lock);
+
+	return ret;
 }
 
 /*
@@ -864,6 +895,7 @@ static int __init split_fs_names(char *page, size_t size)
 {
 	int count = 1;
 	char *p = page;
+	size_t out_len;
 
 	strscpy(p, root_fs_names, size);
 	while (*p++) {
@@ -872,6 +904,17 @@ static int __init split_fs_names(char *page, size_t size)
 			count++;
 		}
 	}
+
+
+	ctx->dctx = zstd_init_dctx(ctx->wksp, ctx->wksp_size);
+	if (!ctx->dctx)
+		return -EINVAL;
+
+	out_len = zstd_decompress_dctx(ctx->dctx, dst, req->dlen, src, req->slen);
+	if (zstd_is_error(out_len))
+		return -EINVAL;
+
+	*dlen = out_len;
 
 	return count;
 }
@@ -2306,6 +2349,84 @@ void smpboot_unregister_percpu_thread(struct smp_hotplug_thread *plug_thread)
 }
 EXPORT_SYMBOL_GPL(smpboot_unregister_percpu_thread);
 
+static int zstd_decompress(struct acomp_req *req)
+{
+	struct crypto_acomp_stream *s;
+	unsigned int total_out = 0;
+	unsigned int scur, dcur;
+	zstd_out_buffer outbuf;
+	struct acomp_walk walk;
+	zstd_in_buffer inbuf;
+	struct zstd_ctx *ctx;
+	size_t pending_bytes;
+	int ret;
+
+	s = crypto_acomp_lock_stream_bh(&zstd_streams);
+	ctx = s->ctx;
+
+	ret = acomp_walk_virt(&walk, req, true);
+	if (ret)
+		goto out;
+
+	ctx->dctx = zstd_init_dstream(ZSTD_MAX_SIZE, ctx->wksp, ctx->wksp_size);
+	if (!ctx->dctx) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	do {
+		scur = acomp_walk_next_src(&walk);
+		if (scur) {
+			inbuf.pos = 0;
+			inbuf.size = scur;
+			inbuf.src = walk.src.virt.addr;
+		} else {
+			break;
+		}
+
+		do {
+			dcur = acomp_walk_next_dst(&walk);
+			if (dcur == req->dlen && scur == req->slen) {
+				ret = zstd_decompress_one(req, ctx, walk.src.virt.addr,
+							  walk.dst.virt.addr, &total_out);
+				acomp_walk_done_dst(&walk, dcur);
+				acomp_walk_done_src(&walk, scur);
+				goto out;
+			}
+
+			if (!dcur) {
+				ret = -ENOSPC;
+				goto out;
+			}
+
+			outbuf.pos = 0;
+			outbuf.dst = (u8 *)walk.dst.virt.addr;
+			outbuf.size = dcur;
+
+			pending_bytes = zstd_decompress_stream(ctx->dctx, &outbuf, &inbuf);
+			if (ZSTD_isError(pending_bytes)) {
+				ret = -EIO;
+				goto out;
+			}
+
+			total_out += outbuf.pos;
+
+			acomp_walk_done_dst(&walk, outbuf.pos);
+		} while (inbuf.pos != scur);
+
+		acomp_walk_done_src(&walk, scur);
+	} while (ret == 0);
+
+out:
+	if (ret)
+		req->dlen = 0;
+	else
+		req->dlen = total_out;
+
+	crypto_acomp_unlock_stream_bh(s);
+
+	return ret;
+}
 
 //WTBD////
 /* Soon */

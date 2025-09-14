@@ -685,3 +685,21 @@ static int __init sched_core_sysctl_init(void)
 }
 late_initcall(sched_core_sysctl_init);
 #endif
+
+void sched_mm_cid_after_execve(struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+	struct rq *rq;
+
+	if (!mm)
+		return;
+
+	preempt_disable();
+	rq = this_rq();
+	scoped_guard (rq_lock_irqsave, rq) {
+		preempt_enable_no_resched();	/* holding spinlock */
+		WRITE_ONCE(t->mm_cid_active, 1);
+		smp_mb();
+		t->last_mm_cid = t->mm_cid = mm_cid_get(rq, t, mm);
+	}
+}

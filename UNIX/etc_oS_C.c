@@ -1119,7 +1119,7 @@ static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
 			return -EINVAL;
 	}
 scx_check:
-#endif /* CONFIG_RT_GROUP_SCHED */
+#endif 
 	return scx_cgroup_can_attach(tset);
 }
 
@@ -1138,6 +1138,45 @@ static void cpu_cgroup_attach(struct cgroup_taskset *tset)
 			WRITE_ONCE(pcpu_cid->time, rq_clock);
 			return;
 		}
+}
+
+static int sysctl_numa_balancing(const struct ctl_table *table, int write,
+			  void *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table t;
+	int err;
+	int state = sysctl_numa_balancing_mode;
+
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	t = *table;
+	t.data = &state;
+	err = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
+	if (err < 0)
+		return err;
+	if (write) {
+		if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
+		    (state & NUMA_BALANCING_MEMORY_TIERING))
+			reset_memory_tiering();
+		sysctl_numa_balancing_mode = state;
+		__set_numabalancing_state(state);
+	}
+	return err;
+}
+#endif 
+#endif
+
+#ifdef CONFIG_SCHEDSTATS
+
+DEFINE_STATIC_KEY_FALSE(sched_schedstats);
+
+static void set_schedstats(bool enabled)
+{
+	if (enabled)
+		static_branch_enable(&sched_schedstats);
+	else
+		static_branch_disable(&sched_schedstats);
 }
 
 static void cpu_cgroup_cancel_attach(struct cgroup_taskset *tset)

@@ -244,6 +244,19 @@ static DEFINE_MUTEX(sched_core_mutex);
 static atomic_t sched_core_count;
 static struct cpumask sched_core_mask;
 
+static inline void wait_for_ap_thread(struct cpuhp_cpu_state *st, bool bringup)
+{
+	struct completion *done = bringup ? &st->done_up : &st->done_down;
+	wait_for_completion(done);
+}
+
+static inline void complete_ap_thread(struct cpuhp_cpu_state *st, bool bringup)
+{
+	struct completion *done = bringup ? &st->done_up : &st->done_down;
+	complete(done);
+}
+
+
 static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 					 struct affinity_context *ctx,
 					 struct rq *rq,

@@ -1,10 +1,10 @@
 # OS_0.01
 
 An experimental os for exploring low-level operating system concepts.  
-This repository contains my custom kernel files, boot code, and utilities written in C and Assembly.  
+This repository contains my custom linux kernel files, boot code, and utilities written in C and Assembly.  
 The goal is to understand, learn and create..a structured os kernel and to practice systems programming at a low level.
 
-This is a personal project. And I'm still working since 2021. Some files are incomplete and and will be update over time with bug fixe and changes.
+This is a personal project. And I'm still working since 2024. Some files are incomplete and and will be updated over time with bug fixes and changes.
 
 
 ---

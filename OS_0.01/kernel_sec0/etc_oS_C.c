@@ -501,24 +501,34 @@ static inline void sched_set_rq_online(struct rq *rq, int cpu)
 	rq_unlock_irqrestore(rq, &rf);
 }
 
-static inline void sched_set_rq_offline(struct rq *rq, int cpu)
+static void print_preempt_disable_ip(int preempt_offset, unsigned long ip)
 {
-	struct rq_flags rf;
+	if (!IS_ENABLED(CONFIG_DEBUG_PREEMPT))
+		return;
 
-	rq_lock_irqsave(rq, &rf);
-	if (rq->rd) {
-		BUG_ON(!cpumask_test_cpu(cpu, rq->rd->span));
-		set_rq_offline(rq);
+	if (preempt_count() == preempt_offset)
+		return;
+
+	pr_err("Preemption disabled at:");
+	print_ip_sym(KERN_ERR, ip);
+}rq_unlock_irqrestore(rq, &rf);
+
+
+static struct cgroup_subsys_state *
+cpu_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+{
+	struct task_group *parent = css_tg(parent_css);
+	struct task_group *tg;
+
+	if (!parent) {
+		return &root_task_group.css;
 	}
-	rq_unlock_irqrestore(rq, &rf);
-}
 
-static void calc_load_migrate(struct rq *rq)
-{
-	long delta = calc_load_fold_active(rq, 1);
+	tg = sched_create_group(parent);
+	if (IS_ERR(tg))
+		return ERR_PTR(-ENOMEM);
 
-	if (delta)
-		atomic_long_add(delta, &calc_load_tasks);
+	return &tg->css;
 }
 
 static void dump_rq_tasks(struct rq *rq, const char *loglvl)
@@ -1081,12 +1091,6 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 	return 0;
 }
 
-static void cpu_cgroup_css_offline(struct cgroup_subsys_state *css)
-{
-	struct task_group *tg = css_tg(css);
-
-	scx_tg_offline(tg);
-}
 
 static void cpu_cgroup_css_released(struct cgroup_subsys_state *css)
 {
@@ -1095,15 +1099,6 @@ static void cpu_cgroup_css_released(struct cgroup_subsys_state *css)
 	sched_release_group(tg);
 }
 
-static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
-{
-	struct task_group *tg = css_tg(css);
-
-	/*
-	 * Relies on the RCU grace period between css_released() and this.
-	 */
-	sched_unregister_group(tg);
-}
 
 static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
 {
@@ -1179,10 +1174,6 @@ static void set_schedstats(bool enabled)
 		static_branch_disable(&sched_schedstats);
 }
 
-static void cpu_cgroup_cancel_attach(struct cgroup_taskset *tset)
-{
-	scx_cgroup_cancel_attach(tset);
-}
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 static void cpu_util_update_eff(struct cgroup_subsys_state *css)
@@ -1230,4 +1221,16 @@ static void cpu_util_update_eff(struct cgroup_subsys_state *css)
 
 		uclamp_update_active_tasks(css);
 	}
+}
+
+static u64 thr_tt(struct group *t)
+{
+	int i;
+	u64 total = 0;
+
+	for_each_possible_cpu(i) {
+		total += READ_ONCE(tg->cfs_rq[i]->throttled_clock_self_time);
+	}
+
+	return total;
 }

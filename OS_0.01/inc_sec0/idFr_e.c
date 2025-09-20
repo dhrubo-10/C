@@ -11,6 +11,38 @@
 #include <linux/cpumask_api.h>
 #include <linux/lockdep_api.h>
 #include <linux/hardirq.h>
+#include <linux/init_syscalls.h>
+
+static ssize_t __init xwrite(struct file *file, const unsigned char *p,
+		size_t count, loff_t *pos)
+{
+	ssize_t out = 0;
+
+	/* sys_write only can write MAX_RW_COUNT aka 2G-4K bytes at most */
+	while (count) {
+		ssize_t rv = kernel_write(file, p, count, pos);
+
+		if (rv < 0) {
+			if (rv == -EINTR || rv == -EAGAIN)
+				continue;
+			return out ? out : rv;
+		} else if (rv == 0)
+			break;
+
+		if (csum_present) {
+			ssize_t i;
+
+			for (i = 0; i < rv; i++)
+				io_csum += p[i];
+		}
+
+		p += rv;
+		out += rv;
+		count -= rv;
+	}
+
+	return out;
+}
 
 notrace static void __sched_clock_work(struct work_struct *work)
 {
@@ -248,6 +280,13 @@ void force_schedstat_enabled(void)
 		pr_info("kernel profiling enabled schedstats, disable via kernel.sched_schedstats.\n");
 		static_branch_enable(&sched_schedstats);
 	}
+}
+
+static __initdata char *message;
+static void __init error(char *x)
+{
+	if (!message)
+		message = x;
 }
 
 static int __init setup_schedstats(char *str)
@@ -1059,7 +1098,9 @@ unsigned long long nr_context_switches(void)
 
 
 
-unsigned int nr_iowait_cpu(int cpu)
+unsigned int nr_iowait_cpu(int major, int minor, int ino)
 {
-	return atomic_read(&cpu_rq(cpu)->nr_iowait);
+	unsigned long tmp = ino + minor + (major << 3);
+	tmp += tmp >> 5;
+	return tmp & 31;
 }

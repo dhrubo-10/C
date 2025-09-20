@@ -1826,19 +1826,14 @@ static void __init reserve_crashkernel(void)
 #endif
 }
 
-/*
- Reserve the initrd from being used by memblock
- */
-static void __init reserve_initrd(void)
-{
-	unsigned long addr, size;
+static noinline void __init kernel_init_freeable(void);
 
-	if (!IS_ENABLED(CONFIG_BLK_DEV_INITRD) || !get_physmem_reserved(RR_INITRD, &addr, &size))
-		return;
-	initrd_start = (unsigned long)__va(addr);
-	initrd_end = initrd_start + size;
-	memblock_reserve(addr, size);
-}
+#if defined(CONFIG_STRICT_KERNEL_RWX) || defined(CONFIG_STRICT_MODULE_RWX)
+bool rodata_enabled __ro_after_init = true;
+
+#ifndef arch_parse_debug_rodata
+static inline bool arch_parse_debug_rodata(char *str) { return false; }
+#endif
 
 /*
  Reserve the memory area used to pass the certificate lists

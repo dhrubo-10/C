@@ -4,6 +4,8 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/smp.h>
+#include <linux/cpu.h>
 
 
 static int kimage_alloc_init(struct kimage **rimage, unsigned long entry,
@@ -702,4 +704,86 @@ void sched_mm_cid_after_execve(struct task_struct *t)
 		smp_mb();
 		t->last_mm_cid = t->mm_cid = mm_cid_get(rq, t, mm);
 	}
+}
+
+static bool csd_lock_wait_toolong(call_single_data_t *csd, u64 ts0, u64 *ts1, int *bug_id, unsigned long *nmessages)
+{
+	int cpu = -1;
+	int cpux;
+	bool firsttime;
+	u64 ts2, ts_delta;
+	call_single_data_t *cpu_cur_csd;
+	unsigned int flags = READ_ONCE(csd->node.u_flags);
+	unsigned long long csd_lock_timeout_ns = csd_lock_timeout * NSEC_PER_MSEC;
+
+	if (!(flags & CSD_FLAG_LOCK)) {
+		if (!unlikely(*bug_id))
+			return true;
+		cpu = csd_lock_wait_getcpu(csd);
+		pr_alert("csd: CSD lock (#%d) got unstuck on CPU#%02d, CPU#%02d released the lock.\n",
+			 *bug_id, raw_smp_processor_id(), cpu);
+		atomic_dec(&n_csd_lock_stuck);
+		return true;
+	}
+
+	ts2 = ktime_get_mono_fast_ns();
+	/* How long since we last checked for a stuck CSD lock.*/
+	ts_delta = ts2 - *ts1;
+	if (likely(ts_delta <= csd_lock_timeout_ns * (*nmessages + 1) *
+			       (!*nmessages ? 1 : (ilog2(num_online_cpus()) / 2 + 1)) ||
+		   csd_lock_timeout_ns == 0))
+		return false;
+
+	if (ts0 > ts2) {
+		/* Our own sched_clock went backward; don't blame another CPU. */
+		ts_delta = ts0 - ts2;
+		pr_alert("sched_clock on CPU %d went backward by %llu ns\n", raw_smp_processor_id(), ts_delta);
+		*ts1 = ts2;
+		return false;
+	}
+
+	firsttime = !*bug_id;
+	if (firsttime)
+		*bug_id = atomic_inc_return(&csd_bug_count);
+	cpu = csd_lock_wait_getcpu(csd);
+	if (WARN_ONCE(cpu < 0 || cpu >= nr_cpu_ids, "%s: cpu = %d\n", __func__, cpu))
+		cpux = 0;
+	else
+		cpux = cpu;
+	cpu_cur_csd = smp_load_acquire(&per_cpu(cur_csd, cpux)); /* Before func and info. */
+	/* How long since this CSD lock was stuck. */
+	ts_delta = ts2 - ts0;
+	pr_alert("csd: %s non-responsive CSD lock (#%d) on CPU#%d, waiting %lld ns for CPU#%02d %pS(%ps).\n",
+		 firsttime ? "Detected" : "Continued", *bug_id, raw_smp_processor_id(), (s64)ts_delta,
+		 cpu, csd->func, csd->info);
+	(*nmessages)++;
+	if (firsttime)
+		atomic_inc(&n_csd_lock_stuck);
+	/*
+	 * If the CSD lock is still stuck after 5 minutes, it is unlikely
+	 * to become unstuck. Use a signed comparison to avoid triggering
+	 * on underflows when the TSC is out of sync between sockets.
+	 */
+	BUG_ON(panic_on_ipistall > 0 && (s64)ts_delta > ((s64)panic_on_ipistall * NSEC_PER_MSEC));
+	if (cpu_cur_csd && csd != cpu_cur_csd) {
+		pr_alert("\tcsd: CSD lock (#%d) handling prior %pS(%ps) request.\n",
+			 *bug_id, READ_ONCE(per_cpu(cur_csd_func, cpux)),
+			 READ_ONCE(per_cpu(cur_csd_info, cpux)));
+	} else {
+		pr_alert("\tcsd: CSD lock (#%d) %s.\n",
+			 *bug_id, !cpu_cur_csd ? "unresponsive" : "handling this request");
+	}
+	if (cpu >= 0) {
+		if (atomic_cmpxchg_acquire(&per_cpu(trigger_backtrace, cpu), 1, 0))
+			dump_cpu_task(cpu);
+		if (!cpu_cur_csd) {
+			pr_alert("csd: Re-sending CSD lock (#%d) IPI from CPU#%02d to CPU#%02d\n", *bug_id, raw_smp_processor_id(), cpu);
+			arch_send_call_function_single_ipi(cpu);
+		}
+	}
+	if (firsttime)
+		dump_stack();
+	*ts1 = ts2;
+
+	return false;
 }

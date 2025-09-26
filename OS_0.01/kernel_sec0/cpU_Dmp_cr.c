@@ -748,6 +748,32 @@ int in_sched_functions(unsigned long addr)
 		&& addr < (unsigned long)__sched_text_end);
 }
 
+/*
+ * config_key_attrs - array of configfs attributes for a key object.
+ *
+ * Includes all attributes exposed to userspace for manipulation.
+ * The array is terminated by NULL as required by configfs.
+ */
+
+/*
+ * config_key_release - release callback for a config key object.
+ *
+ * Frees the memory associated with the key and decrements
+ * the global key_count. This is called when a config_item
+ * is removed from configfs.
+ */
+
+static struct configfs_attribute *config_key_attrs[] = {
+	&config_key_attr_description,
+	NULL,
+};
+
+static void config_key_release(struct config_item *item)
+{
+	kfree(to_config_key(item));
+	key_count--;
+}
+
 int irq_cpu_rmap_add(struct cpu_rmap *rmap, int irq)
 {
 	struct irq_glue *glue = kzalloc(sizeof(*glue), GFP_KERNEL);

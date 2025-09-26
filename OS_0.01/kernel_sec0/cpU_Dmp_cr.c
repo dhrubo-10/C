@@ -324,15 +324,55 @@ out:
 	return ret;
 }
 
-static void sched_core_lock(int cpu, unsigned long *flags)
+int cpu_rmap_update(struct cpu_rmap *rmap, u16 index,
+		    const struct cpumask *affinity)
 {
-	const struct cpumask *smt_mask = cpu_smt_mask(cpu);
-	int t, i = 0;
+	cpumask_var_t update_mask;
+	unsigned int cpu;
 
-	local_irq_save(*flags);
-	for_each_cpu(t, smt_mask)
-		raw_spin_lock_nested(&cpu_rq(t)->__lock, i++);
+	if (unlikely(!zalloc_cpumask_var(&update_mask, GFP_KERNEL)))
+		return -ENOMEM;
+
+
+	for_each_online_cpu(cpu) {
+		if (rmap->near[cpu].index == index) {
+			rmap->near[cpu].dist = CPU_RMAP_DIST_INF;
+			cpumask_set_cpu(cpu, update_mask);
+		}
+	}
+
+	debug_print_rmap(rmap, "after invalidating old distances");
+
+
+	for_each_cpu(cpu, affinity) {
+		rmap->near[cpu].index = index;
+		rmap->near[cpu].dist = 0;
+		cpumask_or(update_mask, update_mask,
+			   cpumask_of_node(cpu_to_node(cpu)));
+	}
+
+	debug_print_rmap(rmap, "after updating neighbours");
+
+	/* Update distances based on topology */
+	for_each_cpu(cpu, update_mask) {
+		if (cpu_rmap_copy_neigh(rmap, cpu,
+					topology_sibling_cpumask(cpu), 1))
+			continue;
+		if (cpu_rmap_copy_neigh(rmap, cpu,
+					topology_core_cpumask(cpu), 2))
+			continue;
+		if (cpu_rmap_copy_neigh(rmap, cpu,
+					cpumask_of_node(cpu_to_node(cpu)), 3))
+			continue;
+
+	}
+
+	debug_print_rmap(rmap, "after copying neighbours");
+
+	free_cpumask_var(update_mask);
+	return 0;
 }
+EXPORT_SYMBOL(cpu_rmap_update);
 
 static void sched_core_unlock(int cpu, unsigned long *flags)
 {
@@ -707,5 +747,36 @@ int in_sched_functions(unsigned long addr)
 		(addr >= (unsigned long)__sched_text_start
 		&& addr < (unsigned long)__sched_text_end);
 }
+
+int irq_cpu_rmap_add(struct cpu_rmap *rmap, int irq)
+{
+	struct irq_glue *glue = kzalloc(sizeof(*glue), GFP_KERNEL);
+	int rc;
+
+	if (!glue)
+		return -ENOMEM;
+	glue->notify.notify = irq_cpu_rmap_notify;
+	glue->notify.release = irq_cpu_rmap_release;
+	glue->rmap = rmap;
+	cpu_rmap_get(rmap);
+	rc = cpu_rmap_add(rmap, glue);
+	if (rc < 0)
+		goto err_add;
+
+	glue->index = rc;
+	rc = irq_set_affinity_notifier(irq, &glue->notify);
+	if (rc)
+		goto err_set;
+
+	return rc;
+
+err_set:
+	rmap->obj[glue->index] = NULL;
+err_add:
+	cpu_rmap_put(glue->rmap);
+	kfree(glue);
+	return rc;
+}
+EXPORT_SYMBOL(irq_cpu_rmap_add);
 
 // TBC

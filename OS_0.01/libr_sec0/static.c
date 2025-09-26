@@ -461,9 +461,6 @@ static ssize_t relay_file_read(struct file *filp,
 	size_t written = 0;
 	int ret;
 
-	if (!count)
-		return 0;
-
 	inode_lock(file_inode(filp));
 	do {
 		void *from;

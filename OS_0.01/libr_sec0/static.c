@@ -504,16 +504,40 @@ const struct file_operations relay_file_operations = {
 };
 EXPORT_SYMBOL_GPL(relay_file_operations);
 
-static unsigned long sched_core_alloc_cookie(void)
+static char *fwctl_devnode(const struct device *dev, umode_t *mode)
 {
-	struct sched_core_cookie *ck = kmalloc(sizeof(*ck), GFP_KERNEL);
-	if (!ck)
-		return 0;
+	return kasprintf(GFP_KERNEL, "fwctl/%s", dev_name(dev));
+}
 
-	refcount_set(&ck->refcnt, 1);
-	sched_core_get();
+static struct class fwctl_class = {
+	.name = "fwctl",
+	.dev_release = fwctl_device_release,
+	.devnode = fwctl_devnode,
+};
 
-	return (unsigned long)ck;
+static struct fwctl_device *
+_alloc_device(struct device *parent, const struct fwctl_ops *ops, size_t size)
+{
+	struct fwctl_device *fwctl __free(kfree) = kzalloc(size, GFP_KERNEL);
+	int devnum;
+
+	if (!fwctl)
+		return NULL;
+
+	devnum = ida_alloc_max(&fwctl_ida, FWCTL_MAX_DEVICES - 1, GFP_KERNEL);
+	if (devnum < 0)
+		return NULL;
+
+	fwctl->dev.devt = fwctl_dev + devnum;
+	fwctl->dev.class = &fwctl_class;
+	fwctl->dev.parent = parent;
+
+	init_rwsem(&fwctl->registration_lock);
+	mutex_init(&fwctl->uctx_list_lock);
+	INIT_LIST_HEAD(&fwctl->uctx_list);
+
+	device_initialize(&fwctl->dev);
+	return_ptr(fwctl);
 }
 
 static void sched_core_put_cookie(unsigned long cookie)

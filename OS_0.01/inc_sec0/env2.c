@@ -1,4 +1,21 @@
 #include "hr.c"
+#include <stddef.h>
+#include <stdarg.h>
+
+
+static int printf(const char *fmt, ...)
+{
+	va_list args;
+	int i;
+
+	va_start(args, fmt);
+	write(1,printbuf,i=vsprintf(printbuf, fmt, args));
+	va_end(args);
+	return i;
+}
+
+static char * argv[] = { "-",NULL };
+static char * envp[] = { "HOME=/usr/root", NULL };
 
 build(op) {
 	register int t1;

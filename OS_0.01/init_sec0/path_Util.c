@@ -1518,6 +1518,24 @@ EXPORT_SYMBOL(print_hex_dump);
 
 #endif // defined(CONFIG_PRINTK) 
 
+void free_irq_cpu_rmap(struct cpu_rmap *rmap)
+{
+	struct irq_glue *glue;
+	u16 index;
+
+	if (!rmap)
+		return;
+
+	for (index = 0; index < rmap->size; index++) {
+		glue = rmap->obj[index];
+		if (glue)
+			irq_set_affinity_notifier(glue->notify.irq, NULL);
+	}
+
+	cpu_rmap_put(rmap);
+}
+EXPORT_SYMBOL(free_irq_cpu_rmap);
+
 static void reset_idle_masks(struct sched_ext_ops *ops)
 {
 	int node;

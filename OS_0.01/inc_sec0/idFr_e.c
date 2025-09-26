@@ -261,6 +261,38 @@ static int sysctl_numa_balancing(const struct ctl_table *table, int write,
 }
 #endif /* CONFIG_PROC_SYSCTL */
 #endif /* CONFIG_NUMA_BALANCING */
+/*
+ * sysctl handler for NUMA balancing hot threshold.
+ *
+ * Allows privileged users (CAP_SYS_ADMIN) to adjust the hot page
+ * threshold used in automatic NUMA balancing decisions.
+ * Uses proc_dointvec_minmax() to enforce range validation and
+ * applies changes only after successful writes.
+ */
+static int sysctl_numa_balancing_hot_threshold(const struct ctl_table *table,
+					       int write, void *buffer,
+					       size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table t;
+	int err;
+	int threshold = sysctl_numa_balancing_hot_threshold_val;
+
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	t = *table;
+	t.data = &threshold;
+	err = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
+	if (err < 0)
+		return err;
+
+	if (write) {
+		/* Ensure value is valid before committing */
+		sysctl_numa_balancing_hot_threshold_val = threshold;
+	}
+	return err;
+}
+
 
 #ifdef CONFIG_SCHEDSTATS
 

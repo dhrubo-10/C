@@ -439,17 +439,22 @@ static ssize_t get_component_active(struct device *cdev,
 	return sysfs_emit(buf, "%d\n", ecomp->active);
 }
 
-static ssize_t set_component_active(struct device *cdev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
+static int __init fwctl_init(void)
 {
-	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
-	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-	int val = simple_strtoul(buf, NULL, 0);
+	int ret;
 
-	if (edev->cb->set_active)
-		edev->cb->set_active(edev, ecomp, val);
-	return count;
+	ret = alloc_chrdev_region(&fwctl_dev, 0, FWCTL_MAX_DEVICES, "fwctl");
+	if (ret)
+		return ret;
+
+	ret = class_register(&fwctl_class);
+	if (ret)
+		goto err_chrdev;
+	return 0;
+
+err_chrdev:
+	unregister_chrdev_region(fwctl_dev, FWCTL_MAX_DEVICES);
+	return ret;
 }
 
 static ssize_t get_component_locate(struct device *cdev,
@@ -463,18 +468,6 @@ static ssize_t get_component_locate(struct device *cdev,
 	return sysfs_emit(buf, "%d\n", ecomp->locate);
 }
 
-static ssize_t set_component_locate(struct device *cdev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
-	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-	int val = simple_strtoul(buf, NULL, 0);
-
-	if (edev->cb->set_locate)
-		edev->cb->set_locate(edev, ecomp, val);
-	return count;
-}
 
 static ssize_t get_component_power_status(struct device *cdev,
 					  struct device_attribute *attr,

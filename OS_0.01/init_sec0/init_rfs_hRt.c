@@ -440,3 +440,51 @@ static void __init error(char *x)
 	exit_code = 1;
 	decompress_error = 1;
 }
+
+
+static __always_inline unsigned long
+radix_tree_find_next_bit(struct radix_tree_node *node, unsigned int tag,
+			 unsigned long offset)
+{
+	const unsigned long *addr = node->tags[tag];
+
+	if (offset < RADIX_TREE_MAP_SIZE) {
+		unsigned long tmp;
+
+		addr += offset / BITS_PER_LONG;
+		tmp = *addr >> (offset % BITS_PER_LONG);
+		if (tmp)
+			return __ffs(tmp) + offset;
+		offset = (offset + BITS_PER_LONG) & ~(BITS_PER_LONG - 1);
+		while (offset < RADIX_TREE_MAP_SIZE) {
+			tmp = *++addr;
+			if (tmp)
+				return __ffs(tmp) + offset;
+			offset += BITS_PER_LONG;
+		}
+	}
+	return RADIX_TREE_MAP_SIZE;
+}
+
+static unsigned int iter_offset(const struct radix_tree_iter *iter)
+{
+	return iter->index & RADIX_TREE_MAP_MASK;
+}
+
+/* The maximum index which can be stored in a radix tree */
+static inline unsigned long shift_maxindex(unsigned int shift)
+{
+	return (RADIX_TREE_MAP_SIZE << shift) - 1;
+}
+
+static inline unsigned long node_maxindex(const struct radix_tree_node *node)
+{
+	return shift_maxindex(node->shift);
+}
+
+static unsigned long next_index(unsigned long index,
+				const struct radix_tree_node *node,
+				unsigned long offset)
+{
+	return (index & ~node_maxindex(node)) + (offset << node->shift);
+}

@@ -78,12 +78,18 @@ static void update_mt_scaling(void)
 
 static inline u64 update_tsk_timer(unsigned long *tsk_vtime, u64 new)
 {
-	u64 delta;
+    /* 
+     * Cast tsk_vtime to u64 before subtraction to avoid type mismatch 
+     * between unsigned long (32-bit on some platforms) and u64. 
+     * This ensures correct delta calculation on both 32-bit and 64-bit systems. 
+     */
+    u64 old = (u64)*tsk_vtime;
+    u64 delta = new - old;
 
-	delta = new - *tsk_vtime;
-	*tsk_vtime = new;
-	return delta;
+    *tsk_vtime = (unsigned long)new;
+    return delta;
 }
+
 
 
 static inline u64 scale_vtime(u64 vtime)
@@ -210,12 +216,20 @@ void vtime_flush(struct task_struct *tsk)
 
 static u64 vtime_delta(void)
 {
-	struct lowcore *lc = get_lowcore();
-	u64 timer = lc->last_update_timer;
+    struct lowcore *lc = get_lowcore();
+    u64 old = lc->last_update_timer;
+    u64 now = get_cpu_timer();
 
-	lc->last_update_timer = get_cpu_timer();
-	return timer - lc->last_update_timer;
+    /* 
+     * Calculate elapsed time since the last update.
+     * Use (now - old) instead of (old - now), because the CPU timer
+     * increases monotonically. The old order would underflow and 
+     * return a bogus large value instead of a proper delta.
+     */
+    lc->last_update_timer = now;
+    return now - old;
 }
+
 
 /*
  * Update process times based on virtual cpu times stored by entry.S

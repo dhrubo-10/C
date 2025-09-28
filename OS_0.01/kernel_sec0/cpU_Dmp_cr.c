@@ -770,9 +770,15 @@ static struct configfs_attribute *config_key_attrs[] = {
 
 static void config_key_release(struct config_item *item)
 {
-	kfree(to_config_key(item));
-	key_count--;
+    /* 
+     * Decrement global key counter before freeing the object,
+     * to avoid touching freed memory and to keep release order clear.
+     * Use atomic operations if key_count is shared across CPUs.
+     */
+    key_count--;   /* or atomic_dec(&key_count) if concurrent access */
+    kfree(to_config_key(item));
 }
+
 
 int irq_cpu_rmap_add(struct cpu_rmap *rmap, int irq)
 {

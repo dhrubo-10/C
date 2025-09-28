@@ -252,3 +252,54 @@ fail:
 	return result;
 }
 #endif
+
+#ifdef CONFIG_KEXEC_FILE
+/*
+ * kexec_file_load:
+ *  System call to load a new kernel image using file descriptors instead of
+ *  user-provided memory segments. This is a safer and more modern interface
+ *  compared to the legacy kexec_load().
+ *
+ *  Arguments:
+ *    @kernel_fd   - file descriptor for the new kernel image
+ *    @initrd_fd   - optional initrd image file descriptor (or -1 if none)
+ *    @cmdline_len - length of command line string
+ *    @cmdline_ptr - user pointer to command line string
+ *    @flags       - kexec flags (must be validated)
+ */
+SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
+                unsigned long, cmdline_len, const char __user *, cmdline_ptr,
+                unsigned long, flags)
+{
+    void __user *ubuf_cmdline;
+    char *kbuf_cmdline;
+    int ret;
+
+    /* Check whether this syscall is permitted under current security policy */
+    if (!kexec_file_load_permitted())
+        return -EPERM;
+
+    /* Validate flags: reject unsupported bits */
+    if ((flags & KEXEC_FILE_FLAGS) != flags)
+        return -EINVAL;
+
+    /* Copy kernel command line from userspace, if provided */
+    if (cmdline_len) {
+        if (cmdline_len > COMMAND_LINE_SIZE)
+            return -EINVAL;
+
+        ubuf_cmdline = (void __user *)cmdline_ptr;
+        kbuf_cmdline = memdup_user_nul(ubuf_cmdline, cmdline_len);
+        if (IS_ERR(kbuf_cmdline))
+            return PTR_ERR(kbuf_cmdline);
+    } else {
+        kbuf_cmdline = NULL;
+    }
+
+    /* Delegate actual image loading to kernel helper */
+    ret = kernel_kexec_file_load(kernel_fd, initrd_fd, kbuf_cmdline, flags);
+
+    kfree(kbuf_cmdline);
+    return ret;
+}
+#endif /* CONFIG_KEXEC_FILE */

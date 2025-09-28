@@ -216,12 +216,20 @@ void vtime_flush(struct task_struct *tsk)
 
 static u64 vtime_delta(void)
 {
-	struct lowcore *lc = get_lowcore();
-	u64 timer = lc->last_update_timer;
+    struct lowcore *lc = get_lowcore();
+    u64 old = lc->last_update_timer;
+    u64 now = get_cpu_timer();
 
-	lc->last_update_timer = get_cpu_timer();
-	return timer - lc->last_update_timer;
+    /* 
+     * Calculate elapsed time since the last update.
+     * Use (now - old) instead of (old - now), because the CPU timer
+     * increases monotonically. The old order would underflow and 
+     * return a bogus large value instead of a proper delta.
+     */
+    lc->last_update_timer = now;
+    return now - old;
 }
+
 
 /*
  * Update process times based on virtual cpu times stored by entry.S

@@ -78,12 +78,18 @@ static void update_mt_scaling(void)
 
 static inline u64 update_tsk_timer(unsigned long *tsk_vtime, u64 new)
 {
-	u64 delta;
+    /* 
+     * Cast tsk_vtime to u64 before subtraction to avoid type mismatch 
+     * between unsigned long (32-bit on some platforms) and u64. 
+     * This ensures correct delta calculation on both 32-bit and 64-bit systems. 
+     */
+    u64 old = (u64)*tsk_vtime;
+    u64 delta = new - old;
 
-	delta = new - *tsk_vtime;
-	*tsk_vtime = new;
-	return delta;
+    *tsk_vtime = (unsigned long)new;
+    return delta;
 }
+
 
 
 static inline u64 scale_vtime(u64 vtime)

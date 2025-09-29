@@ -333,20 +333,31 @@ const char *preempt_model_str(void)
 
 int io_schedule_prepare(void)
 {
-	struct callback_head *work = &curr->cid_work;
+	struct task_struct *t = curr;  /* alias for readability */
+	struct callback_head *work = &t->cid_work;
 	unsigned long now = jiffies;
+	int old_iowait;
 
-	if (!curr->mm || (curr->flags & (PF_EXITING | PF_KTHREAD)) ||
+	/* Bail out if task is exiting, kernel thread, or work is already queued */
+	if (!t->mm || (t->flags & (PF_EXITING | PF_KTHREAD)) ||
 	    work->next != work)
-		return;
-	if (time_before(now, READ_ONCE(curr->mm->mm_cid_next_scan)))
-		return;
-	int old_iowait = current->in_iowait;
+		return 0;
 
-	current->in_iowait = 1;
-	blk_flush_plug(current->plug, true);
+	/* Throttle scanning based on mm->mm_cid_next_scan */
+	if (time_before(now, READ_ONCE(t->mm->mm_cid_next_scan)))
+		return 0;
+
+	old_iowait = t->in_iowait;
+
+	/* Mark task as waiting for I/O */
+	t->in_iowait = 1;
+
+	/* Flush any pending block plugs to start I/O immediately */
+	blk_flush_plug(t->plug, true);
+
 	return old_iowait;
 }
+
 
 void io_schedule_finish(int token)
 {

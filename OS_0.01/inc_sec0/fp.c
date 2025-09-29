@@ -532,13 +532,29 @@ void stcdf()
  FPMODE=1 - FPMODE; stf(); FPMODE=1 - FPMODE;
 }
 
+
+/* Load a double-precision floating-point value from memory into the FPU register */
 void ldcdf()
 {
- ldf();
+ 		AC = (ir >> 6) & 3;   /* Get the accumulator field */
+    load_flt();            /* Load the source float from memory */
+    fregs[AC] = Srcflt;    /* Store it in the FPU register */
+    FPC = 0; FPV = 0;      /* Reset flags */
+    FPZ = (fregs[AC] == 0.0) ? 1 : 0;
+    FPN = (fregs[AC] < 0.0) ? 1 : 0;
 }
+
+
+/* Store FPU status (no-op / placeholder) */
 
 void stst()
 {
+		/* Optionally, store FPU condition codes or other status to memory */
+    /* For now, just clear the flags as a placeholder */
+    FPC = 0;
+    FPZ = 0;
+    FPN = 0;
+    FPV = 0;
 }
 
 void ldexpp()

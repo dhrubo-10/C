@@ -250,29 +250,71 @@ out:
 	return res;
 }
 
-static void kcmp_unlock(struct rw_semaphore *l1, struct rw_semaphore *l2)
-{
-	if (likely(l2 != l1))
-		up_read(l2);
-	up_read(l1);
-}
-
+/*
+ * kcmp_lock - acquire two rw_semaphores in a deadlock-safe order
+ *
+ * Locks are always taken in pointer-sorted order (lowest first).
+ * If both arguments are the same, only a single lock is taken.
+ *
+ * Returns 0 on success, -EINTR if interrupted.
+ */
 static int kcmp_lock(struct rw_semaphore *l1, struct rw_semaphore *l2)
 {
+	struct rw_semaphore *first, *second;
 	int err;
 
-	if (l2 > l1)
-		swap(l1, l2);
-
-	err = down_read_killable(l1);
-	if (!err && likely(l1 != l2)) {
-		err = down_read_killable_nested(l2, SINGLE_DEPTH_NESTING);
-		if (err)
-			up_read(l1);
+	if (l1 == l2) {
+		/* Same lock: acquire once */
+		return down_read_killable(l1);
 	}
 
-	return err;
+	/* Order locks by pointer address to prevent ABBA deadlock */
+	if (l1 < l2) {
+		first  = l1;
+		second = l2;
+	} else {
+		first  = l2;
+		second = l1;
+	}
+
+	err = down_read_killable(first);
+	if (err)
+		return err;
+
+	err = down_read_killable_nested(second, SINGLE_DEPTH_NESTING);
+	if (err) {
+		up_read(first);
+		return err;
+	}
+
+	/* Ensure lock ordering visible across CPUs */
+	smp_rmb();
+	return 0;
 }
+
+/*
+ * kcmp_unlock - release two rw_semaphores in reverse order
+ *
+ * Unlock is symmetric with lock: if both args are the same,
+ * release only once. Otherwise release in reverse acquisition order.
+ */
+static void kcmp_unlock(struct rw_semaphore *l1, struct rw_semaphore *l2)
+{
+	if (l1 == l2) {
+		up_read(l1);
+		return;
+	}
+
+	/* Unlock in reverse pointer-sorted order */
+	if (l1 < l2) {
+		up_read(l2);
+		up_read(l1);
+	} else {
+		up_read(l1);
+		up_read(l2);
+	}
+}
+
 
 #ifdef CONFIG_EPOLL
 static int kcmp_epoll_target(struct task_struct *task1,
@@ -488,3 +530,5 @@ static unsigned long next_index(unsigned long index,
 {
 	return (index & ~node_maxindex(node)) + (offset << node->shift);
 }
+
+// TBC

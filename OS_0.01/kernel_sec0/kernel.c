@@ -188,30 +188,50 @@ static inline int kexec_load_check(unsigned long nr_segments,
 	return 0;
 }
 
-SYSCALL_DEFINE4(kexec_load, unsigned long, entry, unsigned long, nr_segments,
-		struct kexec_segment __user *, segments, unsigned long, flags)
+/*
+ * kexec_load() - system call entry point for loading a new kernel image
+ *
+ * @entry:        Kernel entry point address
+ * @nr_segments:  Number of memory segments provided by user
+ * @segments:     Pointer to user-provided kexec_segment array
+ * @flags:        Kexec flags (control behavior, crash vs normal, etc.)
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+SYSCALL_DEFINE4(kexec_load,
+		unsigned long, entry,
+		unsigned long, nr_segments,
+		struct kexec_segment __user *, segments,
+		unsigned long, flags)
 {
 	struct kexec_segment *ksegments;
-	unsigned long result;
+	int ret;
 
-	result = kexec_load_check(nr_segments, flags);
-	if (result)
-		return result;
+	/* Basic validation of flags and number of segments */
+	ret = kexec_load_check(nr_segments, flags);
+	if (ret)
+		return ret;
 
-
+	/* Validate architecture bits in flags */
 	if (((flags & KEXEC_ARCH_MASK) != KEXEC_ARCH) &&
-		((flags & KEXEC_ARCH_MASK) != KEXEC_ARCH_DEFAULT))
+	    ((flags & KEXEC_ARCH_MASK) != KEXEC_ARCH_DEFAULT))
 		return -EINVAL;
 
-	ksegments = memdup_array_user(segments, nr_segments, sizeof(ksegments[0]));
+	/* Copy segment array safely from userspace */
+	ksegments = memdup_array_user(segments, nr_segments,
+				      sizeof(struct kexec_segment));
 	if (IS_ERR(ksegments))
 		return PTR_ERR(ksegments);
 
-	result = do_kexec_load(entry, nr_segments, ksegments, flags);
+	/* Load image into kernel */
+	ret = do_kexec_load(entry, nr_segments, ksegments, flags);
+
+	/* Clean up */
 	kfree(ksegments);
 
-	return result;
+	return ret;
 }
+
 
 #ifdef CONFIG_COMPAT
 COMPAT_SYSCALL_DEFINE4(kexec_load, compat_ulong_t, entry,

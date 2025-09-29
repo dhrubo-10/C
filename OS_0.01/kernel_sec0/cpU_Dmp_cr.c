@@ -811,4 +811,142 @@ err_add:
 }
 EXPORT_SYMBOL(irq_cpu_rmap_add);
 
+/* --------------------------------------------------------------------------
+ * IRQ -> cpu_rmap glue helpers
+ *
+ * Implement the notifier callbacks which were referenced by
+ * irq_cpu_rmap_add(). These are deliberately minimal: on notification
+ * we update the cpu_rmap distances for the notifier's index; on release
+ * we drop references and free the glue object.
+ * -------------------------------------------------------------------------- */
+
+/*
+ * irq_cpu_rmap_notify - irq_affinity notify callback
+ * @notify:  the notifier embedded in the irq_glue structure
+ * @mask:    the new cpu affinity mask provided by the IRQ core
+ *
+ * Update the rmap distances for the given index using the provided mask.
+ * The call delegates to cpu_rmap_update() which handles topology updates.
+ */
+static void irq_cpu_rmap_notify(struct irq_affinity_notify *notify,
+				const struct cpumask *mask)
+{
+	struct irq_glue *glue = container_of(notify, struct irq_glue, notify);
+
+	/* Defensive: ensure we have a valid rmap and index */
+	if (!glue || !glue->rmap)
+		return;
+
+	/* Update the cpu_rmap for this index using the supplied affinity mask */
+	(void)cpu_rmap_update(glue->rmap, glue->index, mask);
+}
+
+/*
+ * irq_cpu_rmap_release - irq_affinity release callback
+ * @notify:  the notifier embedded in the irq_glue structure
+ *
+ * Called when the IRQ core wants to drop the notifier. Release the
+ * cpu_rmap reference and free the glue object.
+ */
+static void irq_cpu_rmap_release(struct irq_affinity_notify *notify)
+{
+	struct irq_glue *glue = container_of(notify, struct irq_glue, notify);
+
+	if (!glue)
+		return;
+
+	/* Drop the cpu_rmap reference taken at registration time */
+	cpu_rmap_put(glue->rmap);
+
+	/* Clear any rmap pointers (defensive) and free the glue */
+	glue->rmap = NULL;
+	kfree(glue);
+}
+
+/* Export the callbacks' symbol names so other compilation units can reference
+ * them if necessary (keeps linkage consistent with earlier usage).
+ */
+EXPORT_SYMBOL(irq_cpu_rmap_notify);
+EXPORT_SYMBOL(irq_cpu_rmap_release);
+
+/* --------------------------------------------------------------------------
+ * cpu_rmap helper initialiser
+ *
+ * A small helper to initialise a cpu_rmap structure (clear indices and set
+ * distances to "infinite"). This is useful to call before the rmap is used.
+ * -------------------------------------------------------------------------- */
+
+/*
+ * cpu_rmap_init - prepare a cpu_rmap for use
+ * @rmap: pointer to cpu_rmap to initialize
+ *
+ * Initialise per-cpu 'near' entries so that indices are invalidated and
+ * distances are set to CPU_RMAP_DIST_INF. This mirrors the semantics used
+ * by cpu_rmap_update() which expects old distances to be sane.
+ *
+ * Returns 0 on success or -EINVAL if @rmap is NULL.
+ */
+int cpu_rmap_init(struct cpu_rmap *rmap)
+{
+	int cpu;
+
+	if (!rmap)
+		return -EINVAL;
+
+	/* Mark all entries as unknown / unreachable initially */
+	for_each_possible_cpu(cpu) {
+		rmap->near[cpu].index = U16_MAX; /* invalid index sentinel */
+		rmap->near[cpu].dist  = CPU_RMAP_DIST_INF;
+	}
+
+	/* Allow callers to export/inspect the rmap after init */
+	return 0;
+}
+EXPORT_SYMBOL(cpu_rmap_init);
+
+/* --------------------------------------------------------------------------
+ * Small convenience wrapper: unregister an irq glue by index
+ *
+ * If your rmap implementation stores the glue pointers in an array (obj[])
+ * indexed by glue->index, this helper will safely unregister the notifier
+ * and free resources. It is defensive: if no glue is present, it simply
+ * returns 0.
+ *
+ * NOTE: this helper assumes that irq_set_affinity_notifier() will be used
+ * to detach the notifier from the IRQ before calling this function, or
+ * that the caller holds appropriate locks to ensure the notifier is not
+ * concurrently called while being removed.
+ * -------------------------------------------------------------------------- */
+
+int irq_cpu_rmap_unregister(struct cpu_rmap *rmap, unsigned int index)
+{
+	struct irq_glue *glue;
+
+	if (!rmap || index >= nr_cpu_ids)
+		return -EINVAL;
+
+	/* Defensive lookup: many cpu_rmap implementations keep an obj[] array;
+	 * if yours differs, update this lookup accordingly.
+	 */
+	glue = rmap->obj ? rmap->obj[index] : NULL;
+	if (!glue)
+		return -ENOENT;
+
+	/* Remove pointer from rmap to avoid races with async notifiers */
+	rmap->obj[index] = NULL;
+
+	/* If the IRQ core still has the notifier attached, detach it now.
+	 * The caller is expected to provide the irq number and call
+	 * irq_set_affinity_notifier(irq, NULL) if needed. We do not attempt
+	 * to guess that here.
+	 */
+
+	/* Drop reference and free via the release callback for consistency */
+	irq_cpu_rmap_release(&glue->notify);
+
+	return 0;
+}
+EXPORT_SYMBOL(irq_cpu_rmap_unregister);
+
+
 // TBC

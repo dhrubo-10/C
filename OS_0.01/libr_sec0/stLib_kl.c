@@ -129,22 +129,31 @@ static int cp_stat64(struct stat64_emu31 __user *ubuf, struct kstat *stat)
 
 	memset(&tmp, 0, sizeof(tmp));
 
-	tmp.st_dev = huge_encode_dev(stat->dev);
-	tmp.st_ino = stat->ino;
-	tmp.__st_ino = (u32)stat->ino;
+	/* Device and inode */
+    tmp.st_dev     = huge_encode_dev(stat->dev);
+    tmp.st_ino     = stat->ino;
+    tmp.__st_ino   = (__u32)stat->ino;
+
 	tmp.st_mode = stat->mode;
-	tmp.st_nlink = (unsigned int)stat->nlink;
+	tmp.st_nlink   = (__u32)stat->nlink;
 	tmp.st_uid = from_kuid_munged(current_user_ns(), stat->uid);
 	tmp.st_gid = from_kgid_munged(current_user_ns(), stat->gid);
 	tmp.st_rdev = huge_encode_dev(stat->rdev);
-	tmp.st_size = stat->size;
-	tmp.st_blksize = (u32)stat->blksize;
-	tmp.st_blocks = (u32)stat->blocks;
-	tmp.st_atime = (u32)stat->atime.tv_sec;
-	tmp.st_mtime = (u32)stat->mtime.tv_sec;
-	tmp.st_ctime = (u32)stat->ctime.tv_sec;
 
-	return copy_to_user(ubuf,&tmp,sizeof(tmp)) ? -EFAULT : 0; 
+/* File size and storage */
+    tmp.st_size    = stat->size;
+    tmp.st_blksize = (__u32)stat->blksize;
+    tmp.st_blocks  = (__u32)stat->blocks;
+
+	tmp.st_atime = (__u32)stat->atime.tv_sec;
+	tmp.st_mtime = (__u32)stat->mtime.tv_sec;
+	tmp.st_ctime = (__u32)stat->ctime.tv_sec;
+
+	    /* Copy out to user */
+    if (copy_to_user(ubuf, &tmp, sizeof(tmp)))
+        return -EFAULT;
+
+    return 0;
 }
 
 COMPAT_SYSCALL_DEFINE2(s390_stat64, const char __user *, filename, struct stat64_emu31 __user *, statbuf)

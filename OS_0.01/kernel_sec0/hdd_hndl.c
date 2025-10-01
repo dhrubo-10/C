@@ -367,22 +367,41 @@ repeat:
 	wait_on_buffer(bh);
 }
 
+#define MINORS_PER_HD 5  /* Each drive uses 5 minor numbers */
+
 void hd_init(void)
 {
-	int i;
+    int i;
 
-	for (i=0 ; i<NR_REQUEST ; i++) {
-		request[i].hd = -1;
-		request[i].next = NULL;
-	}
-	for (i=0 ; i<NR_HD ; i++) {
-		hd[i*5].start_sect = 0;
-		hd[i*5].nr_sects = hd_info[i].head*
-				hd_info[i].sect*hd_info[i].cyl;
-	}
-	set_trap_gate(0x2E,&hd_interrupt);
-	outb_p(inb_p(0x21)&0xfb,0x21);
-	outb(inb_p(0xA1)&0xbf,0xA1);
+    /* --- Initialize the request queue --- */
+    for (i = 0; i < NR_REQUEST; i++) {
+        request[i].hd = -1;   /* -1 means empty slot */
+        request[i].next = NULL;
+    }
+
+    /* --- Initialize each drive's first minor partition --- */
+    for (i = 0; i < NR_HD; i++) {
+        int total_sectors;
+
+        /* First minor number for this drive */
+        hd[i * MINORS_PER_HD].start_sect = 0;
+
+        /* Total sectors = cylinders * heads * sectors per track */
+        total_sectors = hd_info[i].cyl * hd_info[i].head * hd_info[i].sect;
+        hd[i * MINORS_PER_HD].nr_sects = total_sectors;
+    }
+
+    /* --- Set up HD interrupt vector --- */
+    set_trap_gate(0x2E, &hd_interrupt);
+
+    /*
+     * Enable IRQ2 (cascade to slave PIC) and IRQ14 (primary HD)
+     * by clearing mask bits:
+     *   Master PIC mask bit 2 = 0x04 -> clear (0xFB)
+     *   Slave  PIC mask bit 6 = 0x40 -> clear (0xBF)
+     */
+    outb_p(inb_p(0x21) & 0xFB, 0x21);  /* Enable IRQ2 on master PIC */
+    outb(inb_p(0xA1) & 0xBF, 0xA1);    /* Enable IRQ14 on slave PIC */
 }
 
 static const struct ctl_table mmu_sysctl_table[] = {

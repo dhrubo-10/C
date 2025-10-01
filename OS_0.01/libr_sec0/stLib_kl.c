@@ -159,10 +159,15 @@ static int cp_stat64(struct stat64_emu31 __user *ubuf, struct kstat *stat)
 COMPAT_SYSCALL_DEFINE2(s390_stat64, const char __user *, filename, struct stat64_emu31 __user *, statbuf)
 {
 	struct kstat stat;
-	int ret = vfs_stat(filename, &stat);
-	if (!ret)
-		ret = cp_stat64(statbuf, &stat);
-	return ret;
+	int ret;
+
+    /* Perform VFS stat */
+    ret = vfs_stat(filename, &stat);
+    if (ret)
+        return ret;
+
+    /* Copy results to user-space struct */
+    return cp_stat64(statbuf, &stat);
 }
 
 COMPAT_SYSCALL_DEFINE2(s390_lstat64, const char __user *, filename, struct stat64_emu31 __user *, statbuf)

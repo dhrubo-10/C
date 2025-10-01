@@ -492,21 +492,29 @@ static ssize_t set_component_power_status(struct device *cdev,
 {
 	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
 	struct enclosure_component *ecomp = to_enclosure_component(cdev);
-	int val;
+	int val, ret;
 
-	if (strncmp(buf, "on", 2) == 0 &&
-	    (buf[2] == '\n' || buf[2] == '\0'))
+	/* Strip leading/trailing whitespace safely */
+	while (*buf == ' ' || *buf == '\t')
+		buf++;
+
+	if (sysfs_streq(buf, "on"))
 		val = 1;
-	else if (strncmp(buf, "off", 3) == 0 &&
-	    (buf[3] == '\n' || buf[3] == '\0'))
+	else if (sysfs_streq(buf, "off"))
 		val = 0;
 	else
 		return -EINVAL;
 
-	if (edev->cb->set_power_status)
-		edev->cb->set_power_status(edev, ecomp, val);
+	if (!edev->cb || !edev->cb->set_power_status)
+		return -EOPNOTSUPP;
+
+	ret = edev->cb->set_power_status(edev, ecomp, val);
+	if (ret)
+		return ret;
+
 	return count;
 }
+
 
 static ssize_t get_component_type(struct device *cdev,
 				  struct device_attribute *attr, char *buf)

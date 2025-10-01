@@ -215,8 +215,6 @@ COMPAT_SYSCALL_DEFINE4(s390_fstatat64,
 }
 
 
-
-
 static long fwctl_fops_ioctl(struct file *filp, unsigned int cmd,
 			       unsigned long arg)
 {
@@ -311,6 +309,7 @@ struct fadvise64_64_args {
 	int advice;
 };
 
+/* smart approach bruhh - lyli *-* */
 COMPAT_SYSCALL_DEFINE1(s390_fadvise64_64, struct fadvise64_64_args __user *, args)
 {
 	struct fadvise64_64_args a;

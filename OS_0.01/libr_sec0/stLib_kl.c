@@ -170,35 +170,50 @@ COMPAT_SYSCALL_DEFINE2(s390_stat64, const char __user *, filename, struct stat64
     return cp_stat64(statbuf, &stat);
 }
 
-COMPAT_SYSCALL_DEFINE2(s390_lstat64, const char __user *, filename, struct stat64_emu31 __user *, statbuf)
+COMPAT_SYSCALL_DEFINE2(s390_lstat64,
+                       const char __user *, filename,
+                       struct stat64_emu31 __user *, statbuf)
 {
-	struct kstat stat;
-	int ret = vfs_lstat(filename, &stat);
-	if (!ret)
-		ret = cp_stat64(statbuf, &stat);
-	return ret;
+    struct kstat stat;
+    int ret;
+
+    ret = vfs_lstat(filename, &stat);
+    if (ret)
+        return ret;
+
+    return cp_stat64(statbuf, &stat);
 }
 
-COMPAT_SYSCALL_DEFINE2(s390_fstat64, unsigned int, fd, struct stat64_emu31 __user *, statbuf)
+COMPAT_SYSCALL_DEFINE2(s390_fstat64,
+                       unsigned int, fd,
+                       struct stat64_emu31 __user *, statbuf)
 {
-	struct kstat stat;
-	int ret = vfs_fstat(fd, &stat);
-	if (!ret)
-		ret = cp_stat64(statbuf, &stat);
-	return ret;
+    struct kstat stat;
+    int ret;
+
+    ret = vfs_fstat(fd, &stat);
+    if (ret)
+        return ret;
+
+    return cp_stat64(statbuf, &stat);
 }
 
-COMPAT_SYSCALL_DEFINE4(s390_fstatat64, unsigned int, dfd, const char __user *, filename,
-		       struct stat64_emu31 __user *, statbuf, int, flag)
+COMPAT_SYSCALL_DEFINE4(s390_fstatat64,
+                       unsigned int, dfd,
+                       const char __user *, filename,
+                       struct stat64_emu31 __user *, statbuf,
+                       int, flag)
 {
-	struct kstat stat;
-	int error;
+    struct kstat stat;
+    int ret;
 
-	error = vfs_fstatat(dfd, filename, &stat, flag);
-	if (error)
-		return error;
-	return cp_stat64(statbuf, &stat);
+    ret = vfs_fstatat(dfd, filename, &stat, flag);
+    if (ret)
+        return ret;
+
+    return cp_stat64(statbuf, &stat);
 }
+
 
 
 

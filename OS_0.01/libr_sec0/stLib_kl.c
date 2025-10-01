@@ -42,7 +42,7 @@
 #include <net/scm.h>
 #include <net/sock.h>
 
-#include "compat_linux.h"
+#include "compat_linux.h" /* not finished & included yet */
 
 #ifdef CONFIG_SYSVIPC
 COMPAT_SYSCALL_DEFINE5(s390_ipc, uint, call, int, first, compat_ulong_t, second,
@@ -85,30 +85,43 @@ COMPAT_SYSCALL_DEFINE4(s390_readahead, int, fd, u32, high, u32, low, s32, count)
 	return ksys_readahead(fd, (unsigned long)high << 32 | low, count);
 }
 
+/*
+ * stat64_emu31: A 32-bit emulation of struct stat64
+ * - Provides compatibility for 32-bit userland on 64-bit kernels
+ * - Fields match old Linux ABI requirements
+ */
 struct stat64_emu31 {
-	unsigned long long  st_dev;
-	unsigned int    __pad1;
-#define STAT64_HAS_BROKEN_ST_INO        1
-	u32             __st_ino;
-	unsigned int    st_mode;
-	unsigned int    st_nlink;
-	u32             st_uid;
-	u32             st_gid;
-	unsigned long long  st_rdev;
-	unsigned int    __pad3;
-	long            st_size;
-	u32             st_blksize;
-	unsigned char   __pad4[4];
-	u32             __pad5;     /* future possible st_blocks high bits */
-	u32             st_blocks;  /* Number 512-byte blocks allocated. */
-	u32             st_atime;
-	u32             __pad6;
-	u32             st_mtime;
-	u32             __pad7;
-	u32             st_ctime;
-	u32             __pad8;     /* will be high 32 bits of ctime someday */
-	unsigned long   st_ino;
-};	
+    __u64   st_dev;        /* Device ID */
+    __u32   __pad1;        /* Padding (ABI alignment) */
+
+#define STAT64_HAS_BROKEN_ST_INO  1
+    __u32   __st_ino;      /* Old 32-bit inode number */
+
+    __u32   st_mode;       /* File mode */
+    __u32   st_nlink;      /* Link count */
+    __u32   st_uid;        /* User ID */
+    __u32   st_gid;        /* Group ID */
+
+    __u64   st_rdev;       /* Device type (if special file) */
+    __u32   __pad3;        /* Padding */
+
+    __s64   st_size;       /* Total size, in bytes */
+    __u32   st_blksize;    /* Block size for filesystem I/O */
+
+    __u32   __pad4;        /* Padding */
+    __u32   __pad5;        /* Future st_blocks high bits */
+
+    __u32   st_blocks;     /* 512B blocks allocated */
+
+    __u32   st_atime;      /* Access time (seconds) */
+    __u32   __pad6;        /* High 32 bits of atime (future use) */
+    __u32   st_mtime;      /* Modification time */
+    __u32   __pad7;        /* High 32 bits of mtime (future use) */
+    __u32   st_ctime;      /* Change time */
+    __u32   __pad8;        /* High 32 bits of ctime (future use) */
+
+    __u64   st_ino;        /* Full 64-bit inode number */
+};
 
 static int cp_stat64(struct stat64_emu31 __user *ubuf, struct kstat *stat)
 {

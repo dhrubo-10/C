@@ -19,12 +19,13 @@ static vm_fault_t relay_buf_fault(struct vm_fault *vmf)
 	struct rchan_buf *buf = vmf->vma->vm_private_data;
 	pgoff_t pgoff = vmf->pgoff;
 
-	if (!buf)
+	if (unlikely(!buf))
 		return VM_FAULT_OOM;
 
 	page = vmalloc_to_page(buf->start + (pgoff << PAGE_SHIFT));
-	if (!page)
+	if (unlikely(!page))
 		return VM_FAULT_SIGBUS;
+
 	get_page(page);
 	vmf->page = page;
 
@@ -33,9 +34,10 @@ static vm_fault_t relay_buf_fault(struct vm_fault *vmf)
 
 static void *relay_alloc_buf(struct rchan_buf *buf, size_t *size)
 {
-	void *mem;
-	unsigned int i, j, n_pages;
+	void *mem = NULL;
+	unsigned int i, n_pages;
 
+	/* round up to page */
 	*size = PAGE_ALIGN(*size);
 	n_pages = *size >> PAGE_SHIFT;
 
@@ -44,23 +46,34 @@ static void *relay_alloc_buf(struct rchan_buf *buf, size_t *size)
 		return NULL;
 
 	for (i = 0; i < n_pages; i++) {
-		buf->page_array[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
-		if (unlikely(!buf->page_array[i]))
-			goto depopulate;
-		set_page_private(buf->page_array[i], (unsigned long)buf);
+		struct page *p = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (unlikely(!p)) {
+			/* de-populate pages allocated so far */
+			unsigned int j;
+			for (j = 0; j < i; j++) {
+				__free_page(buf->page_array[j]);
+			}
+			relay_free_page_array(buf->page_array);
+			buf->page_array = NULL;
+			return NULL;
+		}
+		buf->page_array[i] = p;
+		set_page_private(p, (unsigned long)buf);
 	}
+
+	/* map pages into kernel virtual space */
 	mem = vmap(buf->page_array, n_pages, VM_MAP, PAGE_KERNEL);
-	if (!mem)
-		goto depopulate;
+	if (unlikely(!mem)) {
+		/* cleanup allocated pages */
+		for (i = 0; i < n_pages; i++)
+			__free_page(buf->page_array[i]);
+		relay_free_page_array(buf->page_array);
+		buf->page_array = NULL;
+		return NULL;
+	}
 
 	buf->page_count = n_pages;
 	return mem;
-
-depopulate:
-	for (j = 0; j < i; j++)
-		__free_page(buf->page_array[j]);
-	relay_free_page_array(buf->page_array);
-	return NULL;
 }
 
 static struct rchan_buf *relay_create_buf(struct rchan *chan)

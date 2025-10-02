@@ -163,17 +163,29 @@ static ssize_t fei_write(struct file *file, const char __user *buffer,
 	struct fei_attr *attr;
 	unsigned long addr;
 	char *buf, *sym;
+	size_t name_len;
 	int ret;
 
-	/* cut off if it is too long */
+	/* cut off if it is too long (leave room for NUL) */
 	if (count > KSYM_NAME_LEN)
 		count = KSYM_NAME_LEN;
+
+	if (count == 0)
+		return -EINVAL;
 
 	buf = memdup_user_nul(buffer, count);
 	if (IS_ERR(buf))
 		return PTR_ERR(buf);
 
+	/* strip leading/trailing whitespace */
 	sym = strstrip(buf);
+
+	/* defensive: ensure the symbol name isn't suspiciously long */
+	name_len = strnlen(sym, KSYM_NAME_LEN);
+	if (name_len == KSYM_NAME_LEN) {
+		ret = -EINVAL;
+		goto out_free;
+	}
 
 	mutex_lock(&fei_lock);
 
@@ -181,52 +193,64 @@ static ssize_t fei_write(struct file *file, const char __user *buffer,
 	if (sym[0] == '\0') {
 		fei_attr_remove_all();
 		ret = count;
-		goto out;
+		goto out_unlock;
 	}
+
 	/* Writing !function will remove one injection point */
 	if (sym[0] == '!') {
 		attr = fei_attr_lookup(sym + 1);
 		if (!attr) {
 			ret = -ENOENT;
-			goto out;
+			goto out_unlock;
 		}
 		fei_attr_remove(attr);
 		ret = count;
-		goto out;
+		goto out_unlock;
 	}
 
+	/* lookup the symbol address */
 	addr = kallsyms_lookup_name(sym);
 	if (!addr) {
 		ret = -EINVAL;
-		goto out;
+		goto out_unlock;
 	}
+
 	if (!within_error_injection_list(addr)) {
 		ret = -ERANGE;
-		goto out;
+		goto out_unlock;
 	}
+
+	/* ensure we don't already have this injection point */
 	if (fei_attr_lookup(sym)) {
 		ret = -EBUSY;
-		goto out;
+		goto out_unlock;
 	}
+
 	attr = fei_attr_new(sym, addr);
 	if (!attr) {
 		ret = -ENOMEM;
-		goto out;
+		goto out_unlock;
 	}
 
 	ret = register_kprobe(&attr->kp);
 	if (ret) {
+		/* register_kprobe returns negative errno on failure */
 		fei_attr_free(attr);
-		goto out;
+		pr_debug("fei: register_kprobe failed for %s: %d\n", sym, ret);
+		goto out_unlock;
 	}
+
 	fei_debugfs_add_attr(attr);
 	list_add_tail(&attr->list, &fei_attr_list);
 	ret = count;
-out:
+
+out_unlock:
 	mutex_unlock(&fei_lock);
+out_free:
 	kfree(buf);
 	return ret;
 }
+
 
 static const struct file_operations fei_ops = {
 	.open =		fei_open,

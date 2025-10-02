@@ -611,5 +611,211 @@ static inline bool prio_less(const struct task_struct *a,
 	return false;
 }
 
+static void sched_mm_cid_remote_clear_old(struct mm_struct *mm, int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	struct mm_cid *pcpu_cid;
+	struct task_struct *curr;
+	u64 rq_clock;
+
+
+	rq_clock = READ_ONCE(rq->clock);
+	pcpu_cid = per_cpu_ptr(mm->pcpu_cid, cpu);
+
+
+	scoped_guard (rcu) {
+		curr = rcu_dereference(rq->curr);
+		if (READ_ONCE(curr->mm_cid_active) && curr->mm == mm) {
+			WRITE_ONCE(pcpu_cid->time, rq_clock);
+			return;
+		}
+	}
+
+	if (rq_clock < pcpu_cid->time + SCHED_MM_CID_PERIOD_NS)
+		return;
+	sched_mm_cid_remote_clear(mm, pcpu_cid, cpu);
+}
+
+static void sched_mm_cid_remote_clear_weight(struct mm_struct *mm, int cpu,
+					     int weight)
+{
+	struct mm_cid *pcpu_cid;
+	int cid;
+
+	pcpu_cid = per_cpu_ptr(mm->pcpu_cid, cpu);
+	cid = READ_ONCE(pcpu_cid->cid);
+	if (!mm_cid_is_valid(cid) || cid < weight)
+		return;
+	sched_mm_cid_remote_clear(mm, pcpu_cid, cpu);
+}
+
+static void task_mm_cid_work(struct callback_head *work)
+{
+	unsigned long now = jiffies, old_scan, next_scan;
+	struct task_struct *t = current;
+	struct cpumask *cidmask;
+	struct mm_struct *mm;
+	int weight, cpu;
+
+	WARN_ON_ONCE(t != container_of(work, struct task_struct, cid_work));
+
+	work->next = work;	/* Prevent double-add */
+	if (t->flags & PF_EXITING)
+		return;
+	mm = t->mm;
+	if (!mm)
+		return;
+	old_scan = READ_ONCE(mm->mm_cid_next_scan);
+	next_scan = now + msecs_to_jiffies(MM_CID_SCAN_DELAY);
+	if (!old_scan) {
+		unsigned long res;
+
+		res = cmpxchg(&mm->mm_cid_next_scan, old_scan, next_scan);
+		if (res != old_scan)
+			old_scan = res;
+		else
+			old_scan = next_scan;
+	}
+	if (time_before(now, old_scan))
+		return;
+	if (!try_cmpxchg(&mm->mm_cid_next_scan, &old_scan, next_scan))
+		return;
+	cidmask = mm_cidmask(mm);
+	/* Clear cids that were not recently used. */
+	for_each_possible_cpu(cpu)
+		sched_mm_cid_remote_clear_old(mm, cpu);
+	weight = cpumask_weight(cidmask);
+
+	for_each_possible_cpu(cpu)
+		sched_mm_cid_remote_clear_weight(mm, cpu, weight);
+}
+
+void init_sched_mm_cid(struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+	int mm_users = 0;
+
+	if (mm) {
+		mm_users = atomic_read(&mm->mm_users);
+		if (mm_users == 1)
+			mm->mm_cid_next_scan = jiffies + msecs_to_jiffies(MM_CID_SCAN_DELAY);
+	}
+	t->cid_work.next = &t->cid_work;	/* Protect against double add */
+	init_task_work(&t->cid_work, task_mm_cid_work);
+}
+
+void task_tick_mm_cid(struct rq *rq, struct task_struct *curr)
+{
+	struct callback_head *work = &curr->cid_work;
+	unsigned long now = jiffies;
+
+	if (!curr->mm || (curr->flags & (PF_EXITING | PF_KTHREAD)) ||
+	    work->next != work)
+		return;
+	if (time_before(now, READ_ONCE(curr->mm->mm_cid_next_scan)))
+		return;
+
+	/* No page allocation under rq lock */
+	task_work_add(curr, work, TWA_RESUME);
+}
+
+void sched_mm_cid_exit_signals(struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+	struct rq *rq;
+
+	if (!mm)
+		return;
+
+	preempt_disable();
+	rq = this_rq();
+	guard(rq_lock_irqsave)(rq);
+	preempt_enable_no_resched();	/* holding spinlock */
+	WRITE_ONCE(t->mm_cid_active, 0);
+
+	smp_mb();
+	mm_cid_put(mm);
+	t->last_mm_cid = t->mm_cid = -1;
+}
+
+void sched_mm_cid_before_execve(struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+	struct rq *rq;
+
+	if (!mm)
+		return;
+
+	preempt_disable();
+	rq = this_rq();
+	guard(rq_lock_irqsave)(rq);
+	preempt_enable_no_resched();	/* holding spinlock */
+	WRITE_ONCE(t->mm_cid_active, 0);
+
+	smp_mb();
+	mm_cid_put(mm);
+	t->last_mm_cid = t->mm_cid = -1;
+}
+
+void sched_mm_cid_after_execve(struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+	struct rq *rq;
+
+	if (!mm)
+		return;
+
+	preempt_disable();
+	rq = this_rq();
+	scoped_guard (rq_lock_irqsave, rq) {
+		preempt_enable_no_resched();	/* holding spinlock */
+		WRITE_ONCE(t->mm_cid_active, 1);
+
+		smp_mb();
+		t->last_mm_cid = t->mm_cid = mm_cid_get(rq, t, mm);
+	}
+}
+
+void sched_mm_cid_fork(struct task_struct *t)
+{
+	WARN_ON_ONCE(!t->mm || t->mm_cid != -1);
+	t->mm_cid_active = 1;
+}
+#endif /* CONFIG_SCHED_MM_CID */
+
+#ifdef CONFIG_SCHED_CLASS_EXT
+void sched_deq_and_put_task(struct task_struct *p, int queue_flags,
+			    struct sched_enq_and_set_ctx *ctx)
+{
+	struct rq *rq = task_rq(p);
+
+	lockdep_assert_rq_held(rq);
+
+	*ctx = (struct sched_enq_and_set_ctx){
+		.p = p,
+		.queue_flags = queue_flags,
+		.queued = task_on_rq_queued(p),
+		.running = task_current(rq, p),
+	};
+
+	update_rq_clock(rq);
+	if (ctx->queued)
+		dequeue_task(rq, p, queue_flags | DEQUEUE_NOCLOCK);
+	if (ctx->running)
+		put_prev_task(rq, p);
+}
+
+void sched_enq_and_set_task(struct sched_enq_and_set_ctx *ctx)
+{
+	struct rq *rq = task_rq(ctx->p);
+
+	lockdep_assert_rq_held(rq);
+
+	if (ctx->queued)
+		enqueue_task(rq, ctx->p, ctx->queue_flags | ENQUEUE_NOCLOCK);
+	if (ctx->running)
+		set_next_task(rq, ctx->p);
+}
+#endif 
 
 // TBC

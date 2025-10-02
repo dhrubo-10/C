@@ -165,3 +165,81 @@ module_exit(cpuid_exit);
 MODULE_AUTHOR("H. Peter Anvin <hpa@zytor.com>");
 MODULE_DESCRIPTION("x86 generic CPUID driver");
 MODULE_LICENSE("GPL");
+
+/* check */
+
+unsigned long
+arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr0,
+			  unsigned long len, unsigned long pgoff,
+			  unsigned long flags, vm_flags_t vm_flags)
+{
+	struct vm_area_struct *vma;
+	struct mm_struct *mm = current->mm;
+	unsigned long addr = addr0;
+	struct vm_unmapped_area_info info = {};
+
+	/* requested length too big for entire address space */
+	if (len > TASK_SIZE)
+		return -ENOMEM;
+
+	/* No address checking. See comment at mmap_address_hint_valid() */
+	if (flags & MAP_FIXED)
+		return addr;
+
+	/* for MAP_32BIT mappings we force the legacy mmap base */
+	if (!in_32bit_syscall() && (flags & MAP_32BIT))
+		goto bottomup;
+
+	/* requesting a specific address */
+	if (addr) {
+		addr &= PAGE_MASK;
+		if (!mmap_address_hint_valid(addr, len))
+			goto get_unmapped_area;
+
+		vma = find_vma(mm, addr);
+		if (!vma || addr + len <= vm_start_gap(vma))
+			return addr;
+	}
+get_unmapped_area:
+
+	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+	info.length = len;
+	if (!in_32bit_syscall() && (flags & MAP_ABOVE4G))
+		info.low_limit = SZ_4G;
+	else
+		info.low_limit = PAGE_SIZE;
+
+	info.high_limit = get_mmap_base(0);
+	if (!(filp && is_file_hugepages(filp))) {
+		info.start_gap = stack_guard_placement(vm_flags);
+		info.align_offset = pgoff << PAGE_SHIFT;
+	}
+
+	/*
+	 * If hint address is above DEFAULT_MAP_WINDOW, look for unmapped area
+	 * in the full address space.
+	 *
+	 * !in_32bit_syscall() check to avoid high addresses for x32
+	 * (and make it no op on native i386).
+	 */
+	if (addr > DEFAULT_MAP_WINDOW && !in_32bit_syscall())
+		info.high_limit += TASK_SIZE_MAX - DEFAULT_MAP_WINDOW;
+
+	if (filp) {
+		info.align_mask = get_align_mask(filp);
+		info.align_offset += get_align_bits();
+	}
+	addr = vm_unmapped_area(&info);
+	if (!(addr & ~PAGE_MASK))
+		return addr;
+	VM_BUG_ON(addr != -ENOMEM);
+
+bottomup:
+	/*
+	 * A failed mmap() very likely causes application failure,
+	 * so fall back to the bottom-up function here. This scenario
+	 * can happen with large stack limits and large mmap()
+	 * allocations.
+	 */
+	return arch_get_unmapped_area(filp, addr0, len, pgoff, flags, 0);
+}

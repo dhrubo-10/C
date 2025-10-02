@@ -1,11 +1,18 @@
-/* 
-* !! imp
-* do check the functions and work flow carefully, might have leak or reg overflow fix if you find any..
-* i wrote the comments about what does what
-*/
-
 #include <linux/interrupt.h>
+#include <linux/syscore_ops.h>
+#include <linux/i8253.h>
+#include <linux/cpuidle.h>
+#include <linux/smp.h>
+#include <linux/dmi.h>
+#include <linux/suspend.h>
+#include <linux/kthread.h>
+#include <linux/jiffies.h>
 
+#include <asm/olpc.h>
+#include <asm/paravirt.h>
+#include <asm/reboot.h>
+#include <asm/nospec-branch.h>
+#include <asm/ibt.h>
 #include <asm/cpu_entry_area.h>
 #include <asm/set_memory.h>
 #include <asm/traps.h>
@@ -322,4 +329,111 @@ void __init idt_install_sysvec(unsigned int n, const void *function)
 
 	if (!WARN_ON(test_and_set_bit(n, system_vectors)))
 		set_intr_gate(n, function);
+}
+
+/* new additions */
+
+static inline unsigned long __apm_irq_save(void)
+{
+	unsigned long flags;
+	local_save_flags(flags);
+	if (apm_info.allow_ints) {
+		if (irqs_disabled_flags(flags))
+			local_irq_enable();
+	} else
+		local_irq_disable();
+
+	return flags;
+}
+
+#define apm_irq_save(flags) \
+	do { flags = __apm_irq_save(); } while (0)
+
+static inline void apm_irq_restore(unsigned long flags)
+{
+	if (irqs_disabled_flags(flags))
+		local_irq_disable();
+	else if (irqs_disabled())
+		local_irq_enable();
+}
+
+#ifdef APM_ZERO_SEGS
+#	define APM_DECL_SEGS \
+		unsigned int saved_fs; unsigned int saved_gs;
+#	define APM_DO_SAVE_SEGS \
+		savesegment(fs, saved_fs); savesegment(gs, saved_gs)
+#	define APM_DO_RESTORE_SEGS \
+		loadsegment(fs, saved_fs); loadsegment(gs, saved_gs)
+#else
+#	define APM_DECL_SEGS
+#	define APM_DO_SAVE_SEGS
+#	define APM_DO_RESTORE_SEGS
+#endif
+
+struct apm_bios_call {
+	u32 func;
+	/* In and out */
+	u32 ebx;
+	u32 ecx;
+	/* Out only */
+	u32 eax;
+	u32 edx;
+	u32 esi;
+
+	int err;
+};
+
+static int on_cpu0(long (*fn)(void *), struct apm_bios_call *call)
+{
+	int ret;
+
+	/* Don't bother with work_on_cpu in the common case, so we don't
+	 * have to worry about OOM or overhead. */
+	if (get_cpu() == 0) {
+		ret = fn(call);
+		put_cpu();
+	} else {
+		put_cpu();
+		ret = work_on_cpu(0, fn, call);
+	}
+
+	/* work_on_cpu can fail with -ENOMEM */
+	if (ret < 0)
+		call->err = ret;
+	else
+		call->err = (call->eax >> 8) & 0xff;
+
+	return ret;
+}
+
+static long __apm_bios_call_simple(void *_call)
+{
+	u8			error;
+	APM_DECL_SEGS
+	unsigned long		flags;
+	int			cpu;
+	struct desc_struct	save_desc_40;
+	struct desc_struct	*gdt;
+	struct apm_bios_call	*call = _call;
+	u64			ibt;
+
+	cpu = get_cpu();
+	BUG_ON(cpu != 0);
+	gdt = get_cpu_gdt_rw(cpu);
+	save_desc_40 = gdt[0x40 / 8];
+	gdt[0x40 / 8] = bad_bios_desc;
+
+	apm_irq_save(flags);
+	firmware_restrict_branch_speculation_start();
+	ibt = ibt_save(true);
+	APM_DO_SAVE_SEGS;
+	error = apm_bios_call_simple_asm(call->func, call->ebx, call->ecx,
+					 &call->eax);
+	APM_DO_RESTORE_SEGS;
+	ibt_restore(ibt);
+	firmware_restrict_branch_speculation_end();
+	apm_irq_restore(flags);
+	gdt[0x40 / 8] = save_desc_40;
+	put_cpu();
+	return error;
 }

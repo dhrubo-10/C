@@ -1,13 +1,12 @@
 #include <linux/fcntl.h>
 #include <linux/file.h>
 #include <linux/fs.h>
-#include <linux/init_syscalls.h>
+#include <linux/init_syscalls.h> /* removed double call */
 #include <linux/init.h>
 #include <linux/async.h>
 #include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/types.h>
-#include <linux/init_syscalls.h>
 #include <linux/umh.h>
 #include <linux/security.h>
 #include <linux/ctype.h>
@@ -19,7 +18,10 @@
 #include <linux/err.h>
 #include <linux/smp.h>
 #include <linux/delay.h>
-
+#include <linux/extable.h>
+#include <linux/module.h>
+#include <linux/proc_fs.h>
+#include <linux/binfmts.h>
 // Main kernel initialization entry
 // Sets up lowcore, idle threads, timers, initramfs, and initcalls
 
@@ -2489,6 +2491,7 @@ void smpboot_unregister_percpu_thread(struct smp_hotplug_thread *plug_thread)
 }
 EXPORT_SYMBOL_GPL(smpboot_unregister_percpu_thread);
 
+/* add-ons */
 static int zstd_decompress(struct acomp_req *req)
 {
 	struct crypto_acomp_stream *s;
@@ -2585,6 +2588,280 @@ unsigned int uclamp_rq_max_value(struct rq *rq, enum uclamp_id clamp_id,
 	/* No tasks default clamp values */
 	return uclamp_idle_value(rq, clamp_id, clamp_value);
 }
+
+static char * __init xbc_make_cmdline(const char *key)
+{
+	struct xbc_node *root;
+	char *new_cmdline;
+	int ret, len = 0;
+
+	root = xbc_find_node(key);
+	if (!root)
+		return NULL;
+
+	/* Count required buffer size */
+	len = xbc_snprint_cmdline(NULL, 0, root);
+	if (len <= 0)
+		return NULL;
+
+	new_cmdline = memblock_alloc(len + 1, SMP_CACHE_BYTES);
+	if (!new_cmdline) {
+		pr_err("Failed to allocate memory for extra kernel cmdline.\n");
+		return NULL;
+	}
+
+	ret = xbc_snprint_cmdline(new_cmdline, len + 1, root);
+	if (ret < 0 || ret > len) {
+		pr_err("Failed to print extra kernel cmdline.\n");
+		memblock_free(new_cmdline, len + 1);
+		return NULL;
+	}
+
+	return new_cmdline;
+}
+
+asmlinkage __visible __init __no_sanitize_address __noreturn __no_stack_protector
+void start_kernel(void)
+{
+	char *command_line;
+	char *after_dashes;
+
+	set_task_stack_end_magic(&init_task);
+	smp_setup_processor_id();
+	debug_objects_early_init();
+	init_vmlinux_build_id();
+
+	cgroup_init_early();
+
+	local_irq_disable();
+	early_boot_irqs_disabled = true;
+
+	/*
+	 * Interrupts are still disabled. Do necessary setups, then
+	 * enable them.
+	 */
+	boot_cpu_init();
+	page_address_init();
+	pr_notice("%s", linux_banner);
+	setup_arch(&command_line);
+	/* Static keys and static calls are needed by LSMs */
+	jump_label_init();
+	static_call_init();
+	early_security_init();
+	setup_boot_config();
+	setup_command_line(command_line);
+	setup_nr_cpu_ids();
+	setup_per_cpu_areas();
+	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
+	early_numa_node_init();
+	boot_cpu_hotplug_init();
+
+	pr_notice("Kernel command line: %s\n", saved_command_line);
+	/* parameters may set static keys */
+	parse_early_param();
+	after_dashes = parse_args("Booting kernel",
+				  static_command_line, __start___param,
+				  __stop___param - __start___param,
+				  -1, -1, NULL, &unknown_bootoption);
+	print_unknown_bootoptions();
+	if (!IS_ERR_OR_NULL(after_dashes))
+		parse_args("Setting init args", after_dashes, NULL, 0, -1, -1,
+			   NULL, set_init_arg);
+	if (extra_init_args)
+		parse_args("Setting extra init args", extra_init_args,
+			   NULL, 0, -1, -1, NULL, set_init_arg);
+
+	/* Architectural and non-timekeeping rng init, before allocator init */
+	random_init_early(command_line);
+
+	/*
+	 * These use large bootmem allocations and must precede
+	 * initalization of page allocator
+	 */
+	setup_log_buf(0);
+	vfs_caches_init_early();
+	sort_main_extable();
+	trap_init();
+	mm_core_init();
+	poking_init();
+	ftrace_init();
+
+	/* trace_printk can be enabled here */
+	early_trace_init();
+
+	/*
+	 * Set up the scheduler prior starting any interrupts (such as the
+	 * timer interrupt). Full topology setup happens at smp_init()
+	 * time - but meanwhile we still have a functioning scheduler.
+	 */
+	sched_init();
+
+	if (WARN(!irqs_disabled(),
+		 "Interrupts were enabled *very* early, fixing it\n"))
+		local_irq_disable();
+	radix_tree_init();
+	maple_tree_init();
+
+	/*
+	 * Set up housekeeping before setting up workqueues to allow the unbound
+	 * workqueue to take non-housekeeping into account.
+	 */
+	housekeeping_init();
+
+	/*
+	 * Allow workqueue creation and work item queueing/cancelling
+	 * early.  Work item execution depends on kthreads and starts after
+	 * workqueue_init().
+	 */
+	workqueue_init_early();
+
+	rcu_init();
+	kvfree_rcu_init();
+
+	/* Trace events are available after this */
+	trace_init();
+
+	if (initcall_debug)
+		initcall_debug_enable();
+
+	context_tracking_init();
+	/* init some links before init_ISA_irqs() */
+	early_irq_init();
+	init_IRQ();
+	tick_init();
+	rcu_init_nohz();
+	timers_init();
+	srcu_init();
+	hrtimers_init();
+	softirq_init();
+	timekeeping_init();
+	time_init();
+
+	/* This must be after timekeeping is initialized */
+	random_init();
+
+	/* These make use of the fully initialized rng */
+	kfence_init();
+	boot_init_stack_canary();
+
+	perf_event_init();
+	profile_init();
+	call_function_init();
+	WARN(!irqs_disabled(), "Interrupts were enabled early\n");
+
+	early_boot_irqs_disabled = false;
+	local_irq_enable();
+
+	kmem_cache_init_late();
+
+	/*
+	 * HACK ALERT! This is early. We're enabling the console before
+	 * we've done PCI setups etc, and console_init() must be aware of
+	 * this. But we do want output early, in case something goes wrong.
+	 */
+	console_init();
+	if (panic_later)
+		panic("Too many boot %s vars at `%s'", panic_later,
+		      panic_param);
+
+	lockdep_init();
+
+	/*
+	 * Need to run this when irqs are enabled, because it wants
+	 * to self-test [hard/soft]-irqs on/off lock inversion bugs
+	 * too:
+	 */
+	locking_selftest();
+
+#ifdef CONFIG_BLK_DEV_INITRD
+	if (initrd_start && !initrd_below_start_ok &&
+	    page_to_pfn(virt_to_page((void *)initrd_start)) < min_low_pfn) {
+		pr_crit("initrd overwritten (0x%08lx < 0x%08lx) - disabling it.\n",
+		    page_to_pfn(virt_to_page((void *)initrd_start)),
+		    min_low_pfn);
+		initrd_start = 0;
+	}
+#endif
+	setup_per_cpu_pageset();
+	numa_policy_init();
+	acpi_early_init();
+	if (late_time_init)
+		late_time_init();
+	sched_clock_init();
+	calibrate_delay();
+
+	arch_cpu_finalize_init();
+
+	pid_idr_init();
+	anon_vma_init();
+	thread_stack_cache_init();
+	cred_init();
+	fork_init();
+	proc_caches_init();
+	uts_ns_init();
+	key_init();
+	security_init();
+	dbg_late_init();
+	net_ns_init();
+	vfs_caches_init();
+	pagecache_init();
+	signals_init();
+	seq_file_init();
+	proc_root_init();
+	nsfs_init();
+	pidfs_init();
+	cpuset_init();
+	mem_cgroup_init();
+	cgroup_init();
+	taskstats_init_early();
+	delayacct_init();
+
+	acpi_subsystem_init();
+	arch_post_acpi_subsys_init();
+	kcsan_init();
+
+	/* Do the rest non-__init'ed, we're now alive */
+	rest_init();
+
+	/*
+	 * Avoid stack canaries in callers of boot_init_stack_canary for gcc-10
+	 * and older.
+	 */
+#if !__has_attribute(__no_stack_protector__)
+	prevent_tail_call_optimization();
+#endif
+}
+
+static int __init early_hostname(char *arg)
+{
+	size_t bufsize = sizeof(init_uts_ns.name.nodename);
+	size_t maxlen  = bufsize - 1;
+	ssize_t arglen;
+
+	arglen = strscpy(init_uts_ns.name.nodename, arg, bufsize);
+	if (arglen < 0) {
+		pr_warn("hostname parameter exceeds %zd characters and will be truncated",
+			maxlen);
+	}
+	return 0;
+}
+early_param("hostname", early_hostname);
+
+const char linux_proc_banner[] =
+	"%s version %s"
+	" (" LINUX_COMPILE_BY "@" LINUX_COMPILE_HOST ")"
+	" (" LINUX_COMPILER ") %s\n";
+
+BUILD_SALT;
+BUILD_LTO_INFO;
+
+
+struct uts_namespace init_uts_ns __weak;
+const char linux_banner[] __weak;
+
+#include "version-timestamp.c"
+
+EXPORT_SYMBOL_GPL(init_uts_ns);
 
 //WTBD////
 /* Soon */

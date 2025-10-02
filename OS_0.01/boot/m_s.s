@@ -1,5 +1,10 @@
 ; Boot I/O & Runtime Support for the kernel
 
+; for lyli... while checking..
+;i wrote it  in x86_64 bare-metal and compiled with NASM + LD on Linux. so if you try to build,run it on macOS 
+; or Windows, you may need to adjust:
+; NASM/LD toolchain commands, Linking flags, emulator setup, and reg pos.
+; best way- run first compile and run in x86 linux.
 
 global _start
 global putc, putw, flush, getc, getw

@@ -268,4 +268,4 @@ void __sched_core_tick(struct rq *rq)
 	__sched_core_account_forceidle(rq);
 }
 
-#endif 
+#endif

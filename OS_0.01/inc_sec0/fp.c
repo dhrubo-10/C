@@ -1,4 +1,7 @@
 #include <math.h>
+#include <stdint.h>
+#include <string.h>
+
 #ifdef HAVE_POWF
 float powf(float x, float y);
 #else
@@ -557,15 +560,47 @@ void stst()
     FPV = 0;
 }
 
-void ldexpp()
+void ldexpp(void)
 {
- pdpfloat pdptmp;
+    union {
+        float f;
+        uint32_t u;
+    } conv;
 
- AC= (ir >> 6) & 3;
- to11float(&fregs[AC], &pdptmp);
- load_src();
- srcword +=128;
- srcword &= 0xff;
- pdptmp.exp= srcword;
- from11float(&fregs[AC], &pdptmp);
+    uint32_t sign, mantissa;
+    int exponent;
+    float new_val;
+
+    /* Select accumulator (AC0–AC3) */
+    AC = (ir >> 6) & 3;
+
+    /* Get current float register value */
+    conv.f = fregs[AC];
+
+    /* Break it down */
+    sign = (conv.u >> 31) & 0x1;
+    exponent = (int)((conv.u >> 23) & 0xFF);
+    mantissa = conv.u & 0x7FFFFF;
+
+    /* Load source (the new exponent modifier) */
+    load_src();
+
+    /* Modify exponent (bias = 127 for IEEE-754) */
+    exponent = (int)srcword + 127;
+    if (exponent > 255) exponent = 255;  /* clamp overflow */
+    if (exponent < 0) exponent = 0;      /* clamp underflow */
+
+    /* Rebuild float bits */
+    conv.u = (sign << 31) | ((uint32_t)(exponent & 0xFF) << 23) | mantissa;
+
+    /* Write back updated float */
+    fregs[AC] = conv.f;
+    new_val = conv.f;
+
+    /* Update FPU condition flags */
+    FPC = 0;
+    FPV = (fabsf(new_val) > XUL) ? 1 : 0;
+    FPZ = (new_val == 0.0f) ? 1 : 0;
+    FPN = (new_val < 0.0f) ? 1 : 0;
 }
+

@@ -714,20 +714,25 @@ static inline void finish_task(struct task_struct *prev)
 
 static void do_balance_callbacks(struct rq *rq, struct balance_callback *head)
 {
-	void (*func)(struct rq *rq);
 	struct balance_callback *next;
 
 	lockdep_assert_rq_held(rq);
 
 	while (head) {
-		func = (void (*)(struct rq *))head->func;
+		/* Save next callback before invoking this one */
 		next = head->next;
-		head->next = NULL;
-		head = next;
 
-		func(rq);
+		/* Detach current callback from list to avoid accidental reuse */
+		head->next = NULL;
+
+		/* Invoke callback */
+		head->func(rq);
+
+		/* Move to next callback */
+		head = next;
 	}
 }
+
 
 static void balance_push(struct rq *rq);
 

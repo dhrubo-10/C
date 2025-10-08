@@ -1,4 +1,8 @@
-
+#include <linux/init.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/sched/signal.h> 
+#include <linux/rcupdate.h>
 #include "core.h"
 
 struct sched_core_cookie {
@@ -269,3 +273,146 @@ void __sched_core_tick(struct rq *rq)
 }
 
 #endif
+
+/*
+ * Small debugfs interface and helper exports for inspectability.
+ * This is intentionally lightweight and read-only.
+*/
+
+
+
+static struct dentry *sched_core_debugfs_dir;
+
+unsigned long sched_core_cookie_to_id(unsigned long cookie)
+{
+	unsigned long id = 0;
+
+	if (!cookie)
+		return 0;
+
+	ptr_to_hashval((void *)cookie, &id);
+	return id;
+}
+EXPORT_SYMBOL(sched_core_cookie_to_id);
+
+static int sched_core_debug_show(struct seq_file *m, void *v)
+{
+	int cpu;
+	seq_printf(m, "sched_core_count: %d\n", atomic_read(&sched_core_count));
+	seq_printf(m, "sched_core_mask: ");
+
+	for_each_possible_cpu(cpu) {
+		seq_printf(m, cpu ? "%d" : "%d", cpumask_test_cpu(cpu, &sched_core_mask));
+		if (cpu != nr_cpu_ids - 1)
+			seq_putc(m, cpu % 8 == 7 ? '\n' : ' ');
+	}
+	seq_putc(m, '\n');
+
+	seq_printf(m, "sched_core_forceidle_counts (per CPU core):\n");
+	for_each_possible_cpu(cpu) {
+		seq_printf(m, " CPU%2d: core_forceidle_count=%u\n", cpu,
+			   cpu_rq(cpu)->core->core_forceidle_count);
+	}
+
+	return 0;
+}
+
+static int sched_core_debug_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, sched_core_debug_show, NULL);
+}
+
+static const struct file_operations sched_core_debug_fops = {
+	.owner   = THIS_MODULE,
+	.open    = sched_core_debug_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+static int __init sched_core_debugfs_init(void)
+{
+	sched_core_debugfs_dir = debugfs_create_dir("sched_core", NULL);
+	if (!sched_core_debugfs_dir)
+		return -ENOMEM;
+
+	if (!debugfs_create_file("status", 0444, sched_core_debugfs_dir,
+				 NULL, &sched_core_debug_fops)) {
+		debugfs_remove_recursive(sched_core_debugfs_dir);
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+core_initcall(sched_core_debugfs_init);
+
+
+EXPORT_TRACEPOINT_SYMBOL(sched_core_debug_show);
+
+/*
+ * Lists tasks which have sched_core cookies assigned.
+ * Format:
+ *   PID .. TGID ...  COMM ... C.._ID
+*/
+
+
+static int sched_core_tasks_show(struct seq_file *m, void *v)
+{
+	struct task_struct *p;
+
+	seq_printf(m, " PID\tTGID\tCOMM\t\tCOOKIE_ID\n");
+	seq_printf(m, "----\t----\t------------\t--------\n");
+
+	/* rcu read lock while iterating tasks */
+	rcu_read_lock();
+	for_each_process(p) {
+		unsigned long cookie = 0;
+		unsigned long id = 0;
+
+		/* safe clone: increments cookie refcount if not zero */
+		cookie = sched_core_clone_cookie(p);
+		if (!cookie)
+			continue;
+
+		
+		id = sched_core_cookie_to_id(cookie);
+
+		
+		seq_printf(m, "%5d\t%5d\t%-12s\t%#lx\n",
+			   task_pid_nr(p), task_tgid_nr(p), p->comm, id);
+
+		
+		sched_core_put_cookie(cookie);
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int sched_core_tasks_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, sched_core_tasks_show, NULL);
+}
+
+static const struct file_operations sched_core_tasks_fops = {
+	.owner   = THIS_MODULE,
+	.open    = sched_core_tasks_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+static int __init sched_core_tasks_debugfs_init(void)
+{
+	if (!sched_core_debugfs_dir)
+		return -ENODEV;
+
+	if (!debugfs_create_file("tasks", 0444, sched_core_debugfs_dir, NULL,
+				 &sched_core_tasks_fops)) {
+		pr_warn("sched_core: failed to create debugfs tasks file\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+core_initcall(sched_core_tasks_debugfs_init);

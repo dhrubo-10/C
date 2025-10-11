@@ -1,4 +1,14 @@
+/*
+!!!!!!!!!!!!!!!!!!!!!!
+**IMPORTANT NOTE for Lyli:** 
+* This code handles kernel architecture specific signal processing and task initialization.
+*  It directly interacts with CPU register states, signal frames, and kernel threads. 
+* Review and recheck it thoroughly ensure there are absolutely no bugs or errors in the code. 
+* Any bug can cause an immediate kernel panic or system crash.
+*/
 
+
+#include <linux/module.h>
 #include <linux/signal.h>
 #include <linux/ptrace.h>
 #include <linux/personality.h>
@@ -6,7 +16,12 @@
 #include <linux/syscalls.h>
 #include <linux/resume_user_mode.h>
 #include <linux/sched/task_stack.h>
-
+#include <linux/slab.h>
+#include <linux/errno.h>
+#include <linux/sched/signal.h>
+#include <linux/rcupdate.h>
+#include <linux/types.h>
+#include <linux/kernel.h>
 #include <asm/ucontext.h>
 #include <asm/entry.h>
 
@@ -30,7 +45,7 @@ static int save_arcv2_regs(struct sigcontext __user *mctx, struct pt_regs *regs)
 #else
 	v2abi.r58 = v2abi.r59 = 0;
 #endif
-	err = __copy_to_user(&mctx->v2abi, (void const *)&v2abi, sizeof(v2abi));
+	err = copy_to_user(&mctx->v2abi, &v2abi, sizeof(v2abi)) ? -EFAULT : 0;
 #endif
 	return err;
 }
@@ -41,7 +56,8 @@ static int restore_arcv2_regs(struct sigcontext __user *mctx, struct pt_regs *re
 #ifndef CONFIG_ISA_ARCOMPACT
 	struct user_regs_arcv2 v2abi;
 
-	err = __copy_from_user(&v2abi, &mctx->v2abi, sizeof(v2abi));
+	if (copy_from_user(&v2abi, &mctx->v2abi, sizeof(v2abi)))
+		return -EFAULT;
 
 	regs->r30 = v2abi.r30;
 #ifdef CONFIG_ARC_HAS_ACCL_REGS
@@ -52,11 +68,10 @@ static int restore_arcv2_regs(struct sigcontext __user *mctx, struct pt_regs *re
 	return err;
 }
 
-static int
-stash_usr_regs(struct rt_sigframe __user *sf, struct pt_regs *regs,
+static int stash_usr_regs(struct rt_sigframe __user *sf, struct pt_regs *regs,
 	       sigset_t *set)
 {
-	int err;
+	int err = 0;
 	struct user_regs_struct uregs;
 
 	uregs.scratch.bta	= regs->bta;
@@ -83,33 +98,39 @@ stash_usr_regs(struct rt_sigframe __user *sf, struct pt_regs *regs,
 	uregs.scratch.r0	= regs->r0;
 	uregs.scratch.sp	= regs->sp;
 
-	err = __copy_to_user(&(sf->uc.uc_mcontext.regs.scratch), &uregs.scratch,
-			     sizeof(sf->uc.uc_mcontext.regs.scratch));
+	if (copy_to_user(&sf->uc.uc_mcontext.regs.scratch, &uregs.scratch,
+			     sizeof(sf->uc.uc_mcontext.regs.scratch)))
+		return -EFAULT;
 
-	if (is_isa_arcv2())
-		err |= save_arcv2_regs(&(sf->uc.uc_mcontext), regs);
+	if (is_isa_arcv2()) {
+		if (save_arcv2_regs(&sf->uc.uc_mcontext, regs))
+			return -EFAULT;
+	}
 
-	err |= __copy_to_user(&sf->uc.uc_sigmask, set, sizeof(sigset_t));
+	if (copy_to_user(&sf->uc.uc_sigmask, set, sizeof(sigset_t)))
+		return -EFAULT;
 
-	return err ? -EFAULT : 0;
+	return 0;
 }
 
 static int restore_usr_regs(struct pt_regs *regs, struct rt_sigframe __user *sf)
 {
 	sigset_t set;
-	int err;
+	int err = 0;
 	struct user_regs_struct uregs;
 
-	err = __copy_from_user(&set, &sf->uc.uc_sigmask, sizeof(set));
-	err |= __copy_from_user(&uregs.scratch,
-				&(sf->uc.uc_mcontext.regs.scratch),
-				sizeof(sf->uc.uc_mcontext.regs.scratch));
-
-	if (is_isa_arcv2())
-		err |= restore_arcv2_regs(&(sf->uc.uc_mcontext), regs);
-
-	if (err)
+	if (copy_from_user(&set, &sf->uc.uc_sigmask, sizeof(set)))
 		return -EFAULT;
+
+	if (copy_from_user(&uregs.scratch,
+				&sf->uc.uc_mcontext.regs.scratch,
+				sizeof(sf->uc.uc_mcontext.regs.scratch)))
+		return -EFAULT;
+
+	if (is_isa_arcv2()) {
+		if (restore_arcv2_regs(&sf->uc.uc_mcontext, regs))
+			return -EFAULT;
+	}
 
 	set_current_blocked(&set);
 	regs->bta	= uregs.scratch.bta;
@@ -141,10 +162,7 @@ static int restore_usr_regs(struct pt_regs *regs, struct rt_sigframe __user *sf)
 
 static inline int is_do_ss_needed(unsigned int magic)
 {
-	if (MAGIC_SIGALTSTK == magic)
-		return 1;
-	else
-		return 0;
+	return MAGIC_SIGALTSTK == magic;
 }
 
 SYSCALL_DEFINE0(rt_sigreturn)
@@ -153,19 +171,17 @@ SYSCALL_DEFINE0(rt_sigreturn)
 	unsigned int magic;
 	struct pt_regs *regs = current_pt_regs();
 
-
 	current->restart_block.fn = do_no_restart_syscall;
-
 
 	if (regs->sp & 3)
 		goto badframe;
 
-	sf = (struct rt_sigframe __force __user *)(regs->sp);
+	sf = (struct rt_sigframe __user __force *)regs->sp;
 
 	if (!access_ok(sf, sizeof(*sf)))
 		goto badframe;
 
-	if (__get_user(magic, &sf->sigret_magic))
+	if (get_user(magic, &sf->sigret_magic))
 		goto badframe;
 
 	if (unlikely(is_do_ss_needed(magic)))
@@ -175,9 +191,7 @@ SYSCALL_DEFINE0(rt_sigreturn)
 	if (restore_usr_regs(regs, sf))
 		goto badframe;
 
-
 	syscall_wont_restart(regs);
-
 
 	regs->status32 |= STATUS_U_MASK;
 
@@ -195,12 +209,10 @@ static inline void __user *get_sigframe(struct ksignal *ksig,
 	unsigned long sp = sigsp(regs->sp, ksig);
 	void __user *frame;
 
-
-	frame = (void __user *)((sp - framesize) & ~7);
-
+	frame = (void __user *)((sp - framesize) & ~7UL);
 
 	if (!access_ok(frame, framesize))
-		frame = NULL;
+		return NULL;
 
 	return frame;
 }
@@ -216,106 +228,92 @@ setup_rt_frame(struct ksignal *ksig, sigset_t *set, struct pt_regs *regs)
 	if (!sf)
 		return 1;
 
-
-
-	err |= stash_usr_regs(sf, regs, set);
-
+	err = stash_usr_regs(sf, regs, set);
+	if (err)
+		return err;
 
 	if (unlikely(ksig->ka.sa.sa_flags & SA_SIGINFO)) {
-		err |= copy_siginfo_to_user(&sf->info, &ksig->info);
-		err |= __put_user(0, &sf->uc.uc_flags);
-		err |= __put_user(NULL, &sf->uc.uc_link);
-		err |= __save_altstack(&sf->uc.uc_stack, regs->sp);
+		if (copy_siginfo_to_user(&sf->info, &ksig->info))
+			return -EFAULT;
 
+		if (put_user(0, &sf->uc.uc_flags))
+			return -EFAULT;
+
+		if (put_user(NULL, &sf->uc.uc_link))
+			return -EFAULT;
+
+		if (__save_altstack(&sf->uc.uc_stack, regs->sp))
+			return -EFAULT;
 
 		regs->r1 = (unsigned long)&sf->info;
 		regs->r2 = (unsigned long)&sf->uc;
 
-
 		magic = MAGIC_SIGALTSTK;
 	}
 
-	err |= __put_user(magic, &sf->sigret_magic);
-	if (err)
-		return err;
-
+	if (put_user(magic, &sf->sigret_magic))
+		return -EFAULT;
 
 	regs->r0 = ksig->sig;
-
-
 	regs->ret = (unsigned long)ksig->ka.sa.sa_handler;
 
-	if(!(ksig->ka.sa.sa_flags & SA_RESTORER))
+	if (!(ksig->ka.sa.sa_flags & SA_RESTORER))
 		return 1;
 
 	regs->blink = (unsigned long)ksig->ka.sa.sa_restorer;
-
-
 	regs->sp = (unsigned long)sf;
-
-
 	regs->status32 &= ~STATUS_DE_MASK;
 	regs->status32 |= STATUS_L_MASK;
 
-	return err;
+	return 0;
 }
 
 static void arc_restart_syscall(struct k_sigaction *ka, struct pt_regs *regs)
 {
-	switch (regs->r0) {
+	switch ((long)regs->r0) {
 	case -ERESTART_RESTARTBLOCK:
 	case -ERESTARTNOHAND:
-
-		regs->r0 = -EINTR;   /
+		regs->r0 = -EINTR;
 		break;
-
 	case -ERESTARTSYS:
-
 		if (!(ka->sa.sa_flags & SA_RESTART)) {
 			regs->r0 = -EINTR;
 			break;
 		}
 		fallthrough;
-
 	case -ERESTARTNOINTR:
-
 		regs->r0 = regs->orig_r0;
 		regs->ret -= is_isa_arcv2() ? 2 : 4;
 		break;
 	}
 }
 
-
 static void
 handle_signal(struct ksignal *ksig, struct pt_regs *regs)
 {
-	sigset_t *oldset = sigmask_to_save();
+	sigset_t oldset;
 	int failed;
 
-	/* Set up the stack frame */
-	failed = setup_rt_frame(ksig, oldset, regs);
-
+	oldset = sigmask_to_save();
+	failed = setup_rt_frame(ksig, &oldset, regs);
 	signal_setup_done(failed, ksig, 0);
 }
 
 void do_signal(struct pt_regs *regs)
 {
 	struct ksignal ksig;
-	int restart_scall;
-
-	restart_scall = in_syscall(regs) && syscall_restartable(regs);
+	int restart_scall = in_syscall(regs) && syscall_restartable(regs);
 
 	if (test_thread_flag(TIF_SIGPENDING) && get_signal(&ksig)) {
 		if (restart_scall) {
 			arc_restart_syscall(&ksig.ka, regs);
-			syscall_wont_restart(regs);	
+			syscall_wont_restart(regs);
 		}
 		handle_signal(&ksig, regs);
 		return;
 	}
 
 	if (restart_scall) {
-
 		if (regs->r0 == -ERESTARTNOHAND ||
 		    regs->r0 == -ERESTARTSYS || regs->r0 == -ERESTARTNOINTR) {
 			regs->r0 = regs->orig_r0;
@@ -343,7 +341,6 @@ unsigned long init_shadow_call_stack[SCS_SIZE / sizeof(long)] = {
 };
 #endif
 
-
 struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	.thread_info	= INIT_THREAD_INFO(init_task),
@@ -365,16 +362,9 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 	.mm		= NULL,
 	.active_mm	= &init_mm,
 	.faults_disabled_mapping = NULL,
-	.restart_block	= {
-		.fn = do_no_restart_syscall,
-	},
-	.se		= {
-		.group_node 	= LIST_HEAD_INIT(init_task.se.group_node),
-	},
-	.rt		= {
-		.run_list	= LIST_HEAD_INIT(init_task.rt.run_list),
-		.time_slice	= RR_TIMESLICE,
-	},
+	.restart_block	= { .fn = do_no_restart_syscall, },
+	.se		= { .group_node 	= LIST_HEAD_INIT(init_task.se.group_node), },
+	.rt		= { .run_list = LIST_HEAD_INIT(init_task.rt.run_list), .time_slice = RR_TIMESLICE, },
 	.tasks		= LIST_HEAD_INIT(init_task.tasks),
 #ifdef CONFIG_SMP
 	.pushable_tasks	= PLIST_NODE_INIT(init_task.pushable_tasks, MAX_PRIO),
@@ -383,15 +373,7 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 	.sched_task_group = &root_task_group,
 #endif
 #ifdef CONFIG_SCHED_CLASS_EXT
-	.scx		= {
-		.dsq_list.node	= LIST_HEAD_INIT(init_task.scx.dsq_list.node),
-		.sticky_cpu	= -1,
-		.holding_cpu	= -1,
-		.runnable_node	= LIST_HEAD_INIT(init_task.scx.runnable_node),
-		.runnable_at	= INITIAL_JIFFIES,
-		.ddsp_dsq_id	= SCX_DSQ_INVALID,
-		.slice		= SCX_SLICE_DFL,
-	},
+	.scx		= { .dsq_list.node = LIST_HEAD_INIT(init_task.scx.dsq_list.node), .sticky_cpu = -1, .holding_cpu = -1, .runnable_node = LIST_HEAD_INIT(init_task.scx.runnable_node), .runnable_at = INITIAL_JIFFIES, .ddsp_dsq_id = SCX_DSQ_INVALID, .slice = SCX_SLICE_DFL, },
 #endif
 	.ptraced	= LIST_HEAD_INIT(init_task.ptraced),
 	.ptrace_entry	= LIST_HEAD_INIT(init_task.ptrace_entry),
@@ -412,16 +394,13 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 	.signal		= &init_signals,
 	.sighand	= &init_sighand,
 	.nsproxy	= &init_nsproxy,
-	.pending	= {
-		.list = LIST_HEAD_INIT(init_task.pending.list),
-		.signal = {{0}}
-	},
+	.pending	= { .list = LIST_HEAD_INIT(init_task.pending.list), .signal = {{0}} },
 	.blocked	= {{0}},
 	.alloc_lock	= __SPIN_LOCK_UNLOCKED(init_task.alloc_lock),
 	.journal_info	= NULL,
 	INIT_CPU_TIMERS(init_task)
 	.pi_lock	= __RAW_SPIN_LOCK_UNLOCKED(init_task.pi_lock),
-	.timer_slack_ns = 50000, /* 50 usec default slack */
+	.timer_slack_ns = 50000,
 	.thread_pid	= &init_struct_pid,
 	.thread_node	= LIST_HEAD_INIT(init_signals.thread_head),
 #ifdef CONFIG_AUDIT
@@ -451,8 +430,7 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 	.trc_blkd_node = LIST_HEAD_INIT(init_task.trc_blkd_node),
 #endif
 #ifdef CONFIG_CPUSETS
-	.mems_allowed_seq = SEQCNT_SPINLOCK_ZERO(init_task.mems_allowed_seq,
-						 &init_task.alloc_lock),
+	.mems_allowed_seq = SEQCNT_SPINLOCK_ZERO(init_task.mems_allowed_seq, &init_task.alloc_lock),
 #endif
 #ifdef CONFIG_RT_MUTEXES
 	.pi_waiters	= RB_ROOT_CACHED,
@@ -473,15 +451,13 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 	.kasan_depth	= 1,
 #endif
 #ifdef CONFIG_KCSAN
-	.kcsan_ctx = {
-		.scoped_accesses	= {LIST_POISON1, NULL},
-	},
+	.kcsan_ctx = { .scoped_accesses = { LIST_POISON1, NULL }, },
 #endif
 #ifdef CONFIG_TRACE_IRQFLAGS
 	.softirqs_enabled = 1,
 #endif
 #ifdef CONFIG_LOCKDEP
-	.lockdep_depth = 0, /* no locks held yet */
+	.lockdep_depth = 0,
 	.curr_chain_key = INITIAL_CHAIN_KEY,
 	.lockdep_recursion = 0,
 #endif
@@ -504,7 +480,8 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 };
 EXPORT_SYMBOL(init_task);
 
-
 #ifndef CONFIG_THREAD_INFO_IN_TASK
 struct thread_info init_thread_info __init_thread_info = INIT_THREAD_INFO(init_task);
 #endif
+
+MODULE_LICENSE("GPL");

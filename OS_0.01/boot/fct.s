@@ -1,37 +1,82 @@
-/ Format disk packs
 
-da = 177412
+[BITS 32]
+[ORG 0x7C00]
 
-	jsr	pc,4(r5)
-		<ready drive 0 and type y\n\0>; .even
-	jsr	pc,2(r5)
-	mov	r0,-(sp)
-	mov	$'\n,r0
-	jsr	pc,(r5)
-	cmp	(sp)+,$'y
-	beq	1f
-	rts	pc
-1:
-	mov	$203.*2,r4
-	clr	r3
-1:
-	mov	$rkda+2,r0
-	mov	r3,-(r0)
-	mov	$buf,-(r0)
-	mov	$-12.*256.,-(r0)
-	mov	$6003,-(r0)
-2:
-	tstb	(r0)
-	bge	2b
-	tst	(r0)
-	blt	1f
-	add	$20,r3
-	dec	r4
-	bne	1b
-	rts	pc
-1:
-	jsr	pc,4(r5)
-		<fct: error\n\0>; .even
-	rts	pc
+section .text
+global _start
 
-buf:	.=.+2
+_start:
+ 
+    mov esi, msg_ready
+    call print_string
+
+
+    call get_key
+    cmp al, 'y'
+    jne exit
+
+    ; Initialize format loop
+    mov ecx, 203 * 2        ; r4 in PDP-11 version
+    xor ebx, ebx            ; r3 = 0 (sector offset)
+
+fmt_loop:
+    mov eax, ebx            ; current sector (simulating rkda)
+    push eax
+    push buffer             ; simulated buffer pointer
+    push dword -12 * 256    ; simulated byte count
+    push dword 6003         ; simulated command word
+
+    ; Simulate I/O wait
+wait_io:
+    
+    nop
+    dec dword [wait_count]
+    jnz wait_io
+
+   
+    mov eax, [wait_count]
+    test eax, eax
+    js fmt_error
+
+    add ebx, 20             ; next sector
+    dec ecx
+    jnz fmt_loop
+    jmp exit
+
+fmt_error:
+    mov esi, msg_error
+    call print_string
+    jmp exit
+
+
+print_string:
+    mov edi, 0xB8000
+    mov ah, 0x07
+.pr_loop:
+    lodsb
+    or al, al
+    jz .done
+    stosw
+    jmp .pr_loop
+.done:
+    ret
+
+
+get_key:
+    mov al, 'y'
+    ret
+
+
+exit:
+    hlt
+    jmp exit
+
+section .data
+
+msg_ready db "Ready drive 0 and type y", 13, 10, 0
+msg_error db "fct: error", 13, 10, 0
+wait_count dd 100000
+buffer     times 512 db 0
+
+times 510 - ($ - $$) db 0
+dw 0xAA55

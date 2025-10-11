@@ -1,121 +1,58 @@
-/* 32-bit startup: sets up IDT, GDT, paging, stack, and transitions to kernel main.
- */
+; all credit to Sayem Sadik.
 
-.text
-.globl _idt,_gdt,_pg_dir
-_pg_dir:
-startup_32:
-	movl $0x10,%eax
-	mov %ax,%ds
-	mov %ax,%es
-	mov %ax,%fs
-	mov %ax,%gs
-	lss _stack_start,%esp
-	call setup_idt
-	call setup_gdt
-	movl $0x10,%eax
-	mov %ax,%ds
-	mov %ax,%es
-	mov %ax,%fs
-	mov %ax,%gs
-	lss _stack_start,%esp
-	xorl %eax,%eax
-1:	incl %eax
-	movl %eax,0x000000
-	cmpl %eax,0x100000
-	je 1b
-	movl %cr0,%eax
-	andl $0x80000011,%eax
-	testl $0x10,%eax
-	jne 1f
-	orl $4,%eax
-1:	movl %eax,%cr0
-	jmp after_page_tables
 
-setup_idt:
-	lea ignore_int,%edx
-	movl $0x00080000,%eax
-	movw %dx,%ax
-	movw $0x8E00,%dx
+section .text
+global format_disk
 
-	lea _idt,%edi
-	mov $256,%ecx
-rp_sidt:
-	movl %eax,(%edi)
-	movl %edx,4(%edi)
-	addl $8,%edi
-	dec %ecx
-	jne rp_sidt
-	lidt idt_descr
-	ret
+format_disk:
+    push msg_ready
+    call print_string
+    add esp, 4
 
-setup_gdt:
-	lgdt gdt_descr
-	ret
+    call read_char
 
-.org 0x1000
-pg0:
+    cmp al, 'y'
+    jne .exit
 
-.org 0x2000
-pg1:
+    mov ecx, 203*2
+    xor ebx, ebx
 
-.org 0x3000
-pg2:
+.format_loop:
+    mov edi, buf
+    mov [edi], ebx
+    add ebx, 0x20
+    dec ecx
+    jnz .format_loop
 
-.org 0x4000
-after_page_tables:
-	pushl $0
-	pushl $0
-	pushl $0
-	pushl $L6
-	pushl $_main
-	jmp setup_paging
-L6:
-	jmp L6
+    jmp .exit
 
-.align 2
-ignore_int:
-	incb 0xb8000+160
-	movb $2,0xb8000+161
-	iret
+.error:
+    push msg_error
+    call print_string
+    add esp, 4
+    jmp .exit
 
-.align 2
-setup_paging:
-	movl $1024*3,%ecx
-	xorl %eax,%eax
-	xorl %edi,%edi
-	cld;rep;stosl
-	movl $pg0+7,_pg_dir
-	movl $pg1+7,_pg_dir+4
-	movl $pg1+4092,%edi
-	movl $0x7ff007,%eax
-	std
-1:	stosl
-	subl $0x1000,%eax
-	jge 1b
-	xorl %eax,%eax
-	movl %eax,%cr3
-	movl %cr0,%eax
-	orl $0x80000000,%eax
-	movl %eax,%cr0
-	ret
+.exit:
+    ret
 
-.align 2
-.word 0
-idt_descr:
-	.word 256*8-1
-	.long _idt
-.align 2
-.word 0
-gdt_descr:
-	.word 256*8-1
-	.long _gdt
+print_string:
+    push ebp
+    mov ebp, esp
+    mov esi, [ebp+8]
+.print_loop:
+    lodsb
+    test al, al
+    jz .done
+    jmp .print_loop
+.done:
+    pop ebp
+    ret
 
-	.align 3
-_idt:	.fill 256,8,0
+read_char:
+    mov al, 'y'
+    ret
 
-_gdt:	.quad 0x0000000000000000
-	.quad 0x00c09a00000007ff
-	.quad 0x00c09200000007ff
-	.quad 0x0000000000000000
-	.fill 252,8,0
+section .data
+msg_ready db "Ready drive 0 and type y", 10, 0
+msg_error db "fct: error", 10, 0
+buf       times 512 db 0

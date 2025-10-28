@@ -13,7 +13,7 @@
 
 char *read_line(int time_o);
 
-int main(char argc, char **argv)
+int main(int argc, char **argv)
 {
 	char *name;
 

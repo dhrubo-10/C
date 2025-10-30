@@ -1075,33 +1075,14 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 
 	if (parent)
 		sched_online_group(tg, parent);
-	struct rq *rq = task_rq(p);
-
-	lockdep_assert_rq_held(rq);
-
-	*ctx = (struct sched_enq_and_set_ctx){
-		.p = p,
-		.queue_flags = queue_flags,
-		.queued = task_on_rq_queued(p),
-		.running = task_current(rq, p),
-	};
-
-	update_rq_clock(rq);
-	if (ctx->queued)
-		dequeue_task(rq, p, queue_flags | DEQUEUE_NOCLOCK);
-	if (ctx->running)
-		put_prev_task(rq, p);
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
-	/* Propagate the effective uclamp value for the new group */
-	guard(mutex)(&uclamp_mutex);
-	guard(rcu)();
-	cpu_util_update_eff(css);
+	if (tg->uclamp)
+		uclamp_update_active_tasks(&tg->css);
 #endif
 
 	return 0;
 }
-
 
 static void cpu_cgroup_css_released(struct cgroup_subsys_state *css)
 {
@@ -1109,7 +1090,6 @@ static void cpu_cgroup_css_released(struct cgroup_subsys_state *css)
 
 	sched_release_group(tg);
 }
-
 
 static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
 {
@@ -1125,7 +1105,7 @@ static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
 			return -EINVAL;
 	}
 scx_check:
-#endif 
+#endif
 	return scx_cgroup_can_attach(tset);
 }
 
@@ -1138,29 +1118,23 @@ static void cpu_cgroup_attach(struct cgroup_taskset *tset)
 		sched_move_task(task, false);
 
 	scx_cgroup_finish_attach();
-	coped_guard (rcu) {
-		curr = rcu_dereference(rq->curr);
-		if (READ_ONCE(curr->mm_cid_active) && curr->mm == mm) {
-			WRITE_ONCE(pcpu_cid->time, rq_clock);
-			return;
-		}
 }
 
 static int sysctl_numa_balancing(const struct ctl_table *table, int write,
-			  void *buffer, size_t *lenp, loff_t *ppos)
+				 void *buffer, size_t *lenp, loff_t *ppos)
 {
-	struct ctl_table t;
+	struct ctl_table t = *table;
 	int err;
 	int state = sysctl_numa_balancing_mode;
 
 	if (write && !capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
-	t = *table;
 	t.data = &state;
 	err = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
 	if (err < 0)
 		return err;
+
 	if (write) {
 		if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
 		    (state & NUMA_BALANCING_MEMORY_TIERING))
@@ -1168,13 +1142,10 @@ static int sysctl_numa_balancing(const struct ctl_table *table, int write,
 		sysctl_numa_balancing_mode = state;
 		__set_numabalancing_state(state);
 	}
-	return err;
+	return 0;
 }
-#endif 
-#endif
 
 #ifdef CONFIG_SCHEDSTATS
-
 DEFINE_STATIC_KEY_FALSE(sched_schedstats);
 
 static void set_schedstats(bool enabled)
@@ -1184,55 +1155,51 @@ static void set_schedstats(bool enabled)
 	else
 		static_branch_disable(&sched_schedstats);
 }
-
+#endif
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 static void cpu_util_update_eff(struct cgroup_subsys_state *css)
 {
 	struct cgroup_subsys_state *top_css = css;
-	struct uclamp_se *uc_parent = NULL;
-	struct uclamp_se *uc_se = NULL;
+	struct uclamp_se *uc_parent, *uc_se;
 	unsigned int eff[UCLAMP_CNT];
-	enum uclamp_id clamp_id;
+	enum uclamp_id id;
 	unsigned int clamps;
 
 	lockdep_assert_held(&uclamp_mutex);
 	WARN_ON_ONCE(!rcu_read_lock_held());
 
 	css_for_each_descendant_pre(css, top_css) {
-		uc_parent = css_tg(css)->parent
-			? css_tg(css)->parent->uclamp : NULL;
+		uc_parent = css_tg(css)->parent ? css_tg(css)->parent->uclamp : NULL;
+		uc_se = css_tg(css)->uclamp;
 
-		for_each_clamp_id(clamp_id) {
-			/* Assume effective clamps matches requested clamps */
-			eff[clamp_id] = css_tg(css)->uclamp_req[clamp_id].value;
-			/* Cap effective clamps with parent's effective clamps */
-			if (uc_parent &&
-			    eff[clamp_id] > uc_parent[clamp_id].value) {
-				eff[clamp_id] = uc_parent[clamp_id].value;
-			}
+		for_each_clamp_id(id)
+			eff[id] = css_tg(css)->uclamp_req[id].value;
+
+		if (uc_parent) {
+			for_each_clamp_id(id)
+				if (eff[id] > uc_parent[id].value)
+					eff[id] = uc_parent[id].value;
 		}
 
 		eff[UCLAMP_MIN] = min(eff[UCLAMP_MIN], eff[UCLAMP_MAX]);
 
-		clamps = 0x0;
-		uc_se = css_tg(css)->uclamp;
-		for_each_clamp_id(clamp_id) {
-			if (eff[clamp_id] == uc_se[clamp_id].value)
+		clamps = 0;
+		for_each_clamp_id(id) {
+			if (eff[id] == uc_se[id].value)
 				continue;
-			uc_se[clamp_id].value = eff[clamp_id];
-			uc_se[clamp_id].bucket_id = uclamp_bucket_id(eff[clamp_id]);
-			clamps |= (0x1 << clamp_id);
-		}
-		if (!clamps) {
-			css = css_rightmost_descendant(css);
-			continue;
+			uc_se[id].value = eff[id];
+			uc_se[id].bucket_id = uclamp_bucket_id(eff[id]);
+			clamps |= BIT(id);
 		}
 
+		if (!clamps)
+			continue;
 
 		uclamp_update_active_tasks(css);
 	}
 }
+#endif
 
 static u64 thr_tt(struct group *t)
 {
@@ -1245,3 +1212,188 @@ static u64 thr_tt(struct group *t)
 
 	return total;
 }
+
+/* fixed the CPU scheduler  */
+static void cpu_cgroup_migrate_tasks(struct task_group *tg)
+{
+	struct task_struct *g, *p;
+
+	rcu_read_lock();
+	for_each_process(g) {
+		for_each_thread(g, p) {
+			if (p->sched_task_group == tg)
+				sched_move_task(p, false);
+		}
+	}
+	rcu_read_unlock();
+}
+
+static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
+{
+	struct task_group *tg = css_tg(css);
+	struct task_group *parent = css_tg(css->parent);
+	int ret;
+
+	ret = scx_tg_online(tg);
+	if (ret)
+		return ret;
+
+	if (parent)
+		sched_online_group(tg, parent);
+
+	cpu_cgroup_migrate_tasks(tg);
+
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+	if (tg->uclamp)
+		uclamp_update_active_tasks(&tg->css);
+#endif
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(cpu_cgroup_css_online);
+
+static void cpu_cgroup_css_released(struct cgroup_subsys_state *css)
+{
+	struct task_group *tg = css_tg(css);
+
+	sched_release_group(tg);
+}
+EXPORT_SYMBOL_GPL(cpu_cgroup_css_released);
+
+static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
+{
+#ifdef CONFIG_RT_GROUP_SCHED
+	struct task_struct *task;
+	struct cgroup_subsys_state *css;
+
+	if (!rt_group_sched_enabled())
+		goto scx_check;
+
+	cgroup_taskset_for_each(task, css, tset) {
+		if (!sched_rt_can_attach(css_tg(css), task))
+			return -EINVAL;
+	}
+scx_check:
+#endif
+	return scx_cgroup_can_attach(tset);
+}
+EXPORT_SYMBOL_GPL(cpu_cgroup_can_attach);
+
+static void cpu_cgroup_attach(struct cgroup_taskset *tset)
+{
+	struct task_struct *task;
+	struct cgroup_subsys_state *css;
+
+	cgroup_taskset_for_each(task, css, tset)
+		sched_move_task(task, false);
+
+	scx_cgroup_finish_attach();
+}
+EXPORT_SYMBOL_GPL(cpu_cgroup_attach);
+
+static int cpu_cgroup_css_offline(struct cgroup_subsys_state *css)
+{
+	struct task_group *tg = css_tg(css);
+	int ret;
+
+	ret = scx_tg_offline(tg);
+	if (ret)
+		return ret;
+
+	sched_offline_group(tg);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(cpu_cgroup_css_offline);
+
+static int cpu_cgroup_css_activate(struct cgroup_subsys_state *css)
+{
+	struct task_group *tg = css_tg(css);
+
+	return scx_tg_activate(tg);
+}
+EXPORT_SYMBOL_GPL(cpu_cgroup_css_activate);
+
+static int sysctl_numa_balancing(const struct ctl_table *table, int write,
+				 void *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table t = *table;
+	int err;
+	int state = sysctl_numa_balancing_mode;
+
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	t.data = &state;
+	err = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
+	if(err < 0)
+		return err;
+
+	if (write) {
+		if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
+		    (state & NUMA_BALANCING_MEMORY_TIERING))
+			reset_memory_tiering();
+		sysctl_numa_balancing_mode = state;
+		__set_numabalancing_state(state);
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(sysctl_numa_balancing);
+
+#ifdef CONFIG_SCHEDSTATS
+DEFINE_STATIC_KEY_FALSE(sched_schedstats);
+
+static void set_schedstats(bool enabled)
+{
+	if (enabled)
+		static_branch_enable(&sched_schedstats);
+	else
+		static_branch_disable(&sched_schedstats);
+}
+EXPORT_SYMBOL_GPL(set_schedstats);
+#endif
+
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+static void cpu_util_update_eff(struct cgroup_subsys_state *css)
+{
+	struct cgroup_subsys_state *top_css = css;
+	struct uclamp_se *uc_parent, *uc_se;
+	unsigned int eff[UCLAMP_CNT];
+	enum uclamp_id id;
+	unsigned int clamps;
+
+	lockdep_assert_held(&uclamp_mutex);
+	WARN_ON_ONCE(!rcu_read_lock_held());
+
+	css_for_each_descendant_pre(css, top_css) {
+		uc_parent = css_tg(css)->parent ? css_tg(css)->parent->uclamp : NULL;
+		uc_se = css_tg(css)->uclamp;
+
+		for_each_clamp_id(id)
+			eff[id] = css_tg(css)->uclamp_req[id].value;
+
+		if (uc_parent) {
+			for_each_clamp_id(id)
+				if (eff[id] > uc_parent[id].value)
+					eff[id] = uc_parent[id].value;
+		}
+
+		eff[UCLAMP_MIN] = min(eff[UCLAMP_MIN], eff[UCLAMP_MAX]);
+
+		clamps = 0;
+		for_each_clamp_id(id) {
+			if (eff[id] == uc_se[id].value)
+				continue;
+			uc_se[id].value = eff[id];
+			uc_se[id].bucket_id = uclamp_bucket_id(eff[id]);
+			clamps |= BIT(id);
+		}
+
+		if (!clamps)
+			continue;
+
+		uclamp_update_active_tasks(css);
+	}
+}
+EXPORT_SYMBOL_GPL(cpu_util_update_eff);
+#endif

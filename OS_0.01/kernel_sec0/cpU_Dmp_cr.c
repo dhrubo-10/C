@@ -23,6 +23,14 @@
 #include <linux/cpumask_api.h>
 #include <linux/lockdep_api.h>
 #include <linux/hardirq.h>
+#include <linux/sched.h>
+#include <linux/lockdep.h>
+#include <linux/configfs.h>
+#include <linux/irq.h>
+#include <linux/cpu_rmap.h>
+#include <linux/slab.h>
+#include <linux/tracepoint.h>
+#include <linux/ktime.h>
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpu);
 EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpumask);
@@ -690,23 +698,56 @@ void update_rq_clock(struct rq *rq)
 	update_rq_clock_task(rq, delta);
 }
 
+/* updated section */
+
 int io_schedule_prepare(void)
 {
 	int old_iowait = current->in_iowait;
 
+#ifdef CONFIG_IO_SCHED_DEBUG
+	u64 start_ns = ktime_get_ns();
+#endif
+
 	current->in_iowait = 1;
-	blk_flush_plug(current->plug, true);
+
+	/* Flush any pending I/O plugs if they exist */
+	if (current->plug)
+		blk_flush_plug(current->plug, true);
+
+#ifdef CONFIG_IO_SCHED_DEBUG
+	u64 end_ns = ktime_get_ns();
+	pr_debug("[io_sched] %s[%d] entered io_schedule_prepare(), took %llu ns\n",
+	         current->comm, current->pid,
+	         (unsigned long long)(end_ns - start_ns));
+#endif
+
+#ifdef CONFIG_SCHED_TRACING
+	trace_io_schedule_prepare(current);
+#endif
+
 	return old_iowait;
 }
+EXPORT_SYMBOL(io_schedule_prepare);
 
 #ifdef CONFIG_SCHED_HRTICK
-
+/*
+ * hrtick_clear - cancel an active high-resolution tick timer
+ */
 static void hrtick_clear(struct rq *rq)
 {
-	if (hrtimer_active(&rq->hrtick_timer))
-		hrtimer_cancel(&rq->hrtick_timer);
+	if (hrtimer_active(&rq->hrtick_timer)) {
+		int ret = hrtimer_cancel(&rq->hrtick_timer);
+#ifdef CONFIG_SCHED_DEBUG
+		if (ret)
+			pr_debug("[hrtick] Cleared active hrtick on CPU %d\n", cpu_of(rq));
+#endif
+	}
 }
 
+/*
+ * hrtick - high-resolution scheduler tick
+ * Drives fine-grained task preemption and time-slice accounting.
+ */
 static enum hrtimer_restart hrtick(struct hrtimer *timer)
 {
 	struct rq *rq = container_of(timer, struct rq, hrtick_timer);
@@ -716,13 +757,31 @@ static enum hrtimer_restart hrtick(struct hrtimer *timer)
 
 	rq_lock(rq, &rf);
 	update_rq_clock(rq);
-	rq->donor->sched_class->task_tick(rq, rq->curr, 1);
+
+#ifdef CONFIG_SCHED_HRTICK_DEBUG
+	pr_debug("[hrtick] tick on CPU %d for %s[%d]\n",
+	         cpu_of(rq), rq->curr->comm, rq->curr->pid);
+#endif
+
+	if (likely(rq->curr->sched_class && rq->curr->sched_class->task_tick))
+		rq->curr->sched_class->task_tick(rq, rq->curr, 1);
+	else
+		pr_warn_once("[hrtick] Missing task_tick() handler on CPU %d\n",
+		             cpu_of(rq));
+
 	rq_unlock(rq, &rf);
+
+#ifdef CONFIG_SCHED_TRACING
+	trace_sched_hrtick(cpu_of(rq), rq->curr);
+#endif
 
 	return HRTIMER_NORESTART;
 }
-#endif
+#endif /* CONFIG_SCHED_HRTICK */
 
+/*
+ * __cond_resched_rwlock_read - conditional reschedule for read locks
+ */
 int __cond_resched_rwlock_read(rwlock_t *lock)
 {
 	int resched = should_resched(PREEMPT_LOCK_OFFSET);
@@ -741,27 +800,19 @@ int __cond_resched_rwlock_read(rwlock_t *lock)
 }
 EXPORT_SYMBOL(__cond_resched_rwlock_read);
 
+/*
+ * in_sched_functions - check whether @addr lies inside scheduler functions
+ */
 int in_sched_functions(unsigned long addr)
 {
 	return in_lock_functions(addr) ||
-		(addr >= (unsigned long)__sched_text_start
-		&& addr < (unsigned long)__sched_text_end);
+	       (addr >= (unsigned long)__sched_text_start &&
+	        addr < (unsigned long)__sched_text_end);
 }
 
-/*
- * config_key_attrs - array of configfs attributes for a key object.
- *
- * Includes all attributes exposed to userspace for manipulation.
- * The array is terminated by NULL as required by configfs.
- */
-
-/*
- * config_key_release - release callback for a config key object.
- *
- * Frees the memory associated with the key and decrements
- * the global key_count. This is called when a config_item
- * is removed from configfs.
- */
+/* --------------------------------------------------------------------------
+ * config_key support helpers
+ * -------------------------------------------------------------------------- */
 
 static struct configfs_attribute *config_key_attrs[] = {
 	&config_key_attr_description,
@@ -770,13 +821,16 @@ static struct configfs_attribute *config_key_attrs[] = {
 
 static void config_key_release(struct config_item *item)
 {
-    /* 
-     * Decrement global key counter before freeing the object,
-     * to avoid touching freed memory and to keep release order clear.
-     * Use atomic operations if key_count is shared across CPUs.
-     */
-    key_count--;   /* or atomic_dec(&key_count) if concurrent access */
-    kfree(to_config_key(item));
+	/*
+	 * Ensure release order: decrement counter before freeing.
+	 * If key_count is shared across CPUs, use atomic operations.
+	 */
+#ifdef CONFIG_SMP
+	atomic_dec(&key_count);
+#else
+	key_count--;
+#endif
+	kfree(to_config_key(item));
 }
 
 
@@ -787,10 +841,13 @@ int irq_cpu_rmap_add(struct cpu_rmap *rmap, int irq)
 
 	if (!glue)
 		return -ENOMEM;
-	glue->notify.notify = irq_cpu_rmap_notify;
+
+	glue->notify.notify  = irq_cpu_rmap_notify;
 	glue->notify.release = irq_cpu_rmap_release;
 	glue->rmap = rmap;
+
 	cpu_rmap_get(rmap);
+
 	rc = cpu_rmap_add(rmap, glue);
 	if (rc < 0)
 		goto err_add;
@@ -811,43 +868,18 @@ err_add:
 }
 EXPORT_SYMBOL(irq_cpu_rmap_add);
 
-/* --------------------------------------------------------------------------
- * IRQ -> cpu_rmap glue helpers
- *
- * Implement the notifier callbacks which were referenced by
- * irq_cpu_rmap_add(). These are deliberately minimal: on notification
- * we update the cpu_rmap distances for the notifier's index; on release
- * we drop references and free the glue object.
- * -------------------------------------------------------------------------- */
-
-/*
- * irq_cpu_rmap_notify - irq_affinity notify callback
- * @notify:  the notifier embedded in the irq_glue structure
- * @mask:    the new cpu affinity mask provided by the IRQ core
- *
- * Update the rmap distances for the given index using the provided mask.
- * The call delegates to cpu_rmap_update() which handles topology updates.
- */
 static void irq_cpu_rmap_notify(struct irq_affinity_notify *notify,
 				const struct cpumask *mask)
 {
 	struct irq_glue *glue = container_of(notify, struct irq_glue, notify);
 
-	/* Defensive: ensure we have a valid rmap and index */
 	if (!glue || !glue->rmap)
 		return;
 
-	/* Update the cpu_rmap for this index using the supplied affinity mask */
-	(void)cpu_rmap_update(glue->rmap, glue->index, mask);
+	cpu_rmap_update(glue->rmap, glue->index, mask);
 }
+EXPORT_SYMBOL(irq_cpu_rmap_notify);
 
-/*
- * irq_cpu_rmap_release - irq_affinity release callback
- * @notify:  the notifier embedded in the irq_glue structure
- *
- * Called when the IRQ core wants to drop the notifier. Release the
- * cpu_rmap reference and free the glue object.
- */
 static void irq_cpu_rmap_release(struct irq_affinity_notify *notify)
 {
 	struct irq_glue *glue = container_of(notify, struct irq_glue, notify);
@@ -855,37 +887,13 @@ static void irq_cpu_rmap_release(struct irq_affinity_notify *notify)
 	if (!glue)
 		return;
 
-	/* Drop the cpu_rmap reference taken at registration time */
 	cpu_rmap_put(glue->rmap);
-
-	/* Clear any rmap pointers (defensive) and free the glue */
 	glue->rmap = NULL;
 	kfree(glue);
 }
-
-/* Export the callbacks' symbol names so other compilation units can reference
- * them if necessary (keeps linkage consistent with earlier usage).
- */
-EXPORT_SYMBOL(irq_cpu_rmap_notify);
 EXPORT_SYMBOL(irq_cpu_rmap_release);
 
-/* --------------------------------------------------------------------------
- * cpu_rmap helper initialiser
- *
- * A small helper to initialise a cpu_rmap structure (clear indices and set
- * distances to "infinite"). This is useful to call before the rmap is used.
- * -------------------------------------------------------------------------- */
 
-/*
- * cpu_rmap_init - prepare a cpu_rmap for use
- * @rmap: pointer to cpu_rmap to initialize
- *
- * Initialise per-cpu 'near' entries so that indices are invalidated and
- * distances are set to CPU_RMAP_DIST_INF. This mirrors the semantics used
- * by cpu_rmap_update() which expects old distances to be sane.
- *
- * Returns 0 on success or -EINVAL if @rmap is NULL.
- */
 int cpu_rmap_init(struct cpu_rmap *rmap)
 {
 	int cpu;
@@ -893,30 +901,14 @@ int cpu_rmap_init(struct cpu_rmap *rmap)
 	if (!rmap)
 		return -EINVAL;
 
-	/* Mark all entries as unknown / unreachable initially */
 	for_each_possible_cpu(cpu) {
-		rmap->near[cpu].index = U16_MAX; /* invalid index sentinel */
+		rmap->near[cpu].index = U16_MAX;
 		rmap->near[cpu].dist  = CPU_RMAP_DIST_INF;
 	}
 
-	/* Allow callers to export/inspect the rmap after init */
 	return 0;
 }
 EXPORT_SYMBOL(cpu_rmap_init);
-
-/* --------------------------------------------------------------------------
- * Small convenience wrapper: unregister an irq glue by index
- *
- * If your rmap implementation stores the glue pointers in an array (obj[])
- * indexed by glue->index, this helper will safely unregister the notifier
- * and free resources. It is defensive: if no glue is present, it simply
- * returns 0.
- *
- * NOTE: this helper assumes that irq_set_affinity_notifier() will be used
- * to detach the notifier from the IRQ before calling this function, or
- * that the caller holds appropriate locks to ensure the notifier is not
- * concurrently called while being removed.
- * -------------------------------------------------------------------------- */
 
 int irq_cpu_rmap_unregister(struct cpu_rmap *rmap, unsigned int index)
 {
@@ -925,28 +917,157 @@ int irq_cpu_rmap_unregister(struct cpu_rmap *rmap, unsigned int index)
 	if (!rmap || index >= nr_cpu_ids)
 		return -EINVAL;
 
-	/* Defensive lookup: many cpu_rmap implementations keep an obj[] array;
-	 * if yours differs, update this lookup accordingly.
-	 */
 	glue = rmap->obj ? rmap->obj[index] : NULL;
 	if (!glue)
 		return -ENOENT;
 
-	/* Remove pointer from rmap to avoid races with async notifiers */
 	rmap->obj[index] = NULL;
-
-	/* If the IRQ core still has the notifier attached, detach it now.
-	 * The caller is expected to provide the irq number and call
-	 * irq_set_affinity_notifier(irq, NULL) if needed. We do not attempt
-	 * to guess that here.
-	 */
-
-	/* Drop reference and free via the release callback for consistency */
 	irq_cpu_rmap_release(&glue->notify);
 
 	return 0;
 }
 EXPORT_SYMBOL(irq_cpu_rmap_unregister);
+
+static inline void sched_diag_record_io_wait(u64 delta)
+{
+	struct sched_diag *diag = this_cpu_ptr(&cpu_sched_diag);
+	raw_spin_lock(&diag->lock);
+	diag->total_io_wait_ns += delta;
+	diag->io_wait_count++;
+	raw_spin_unlock(&diag->lock);
+}
+
+
+void io_schedule_complete(int old_iowait)
+{
+#ifdef CONFIG_SCHED_DEBUG
+	static DEFINE_PER_CPU(u64, io_wait_start_ns);
+	u64 now = ktime_get_ns();
+	u64 delta = now - this_cpu_read(io_wait_start_ns);
+
+	sched_diag_record_io_wait(delta);
+
+	pr_debug("[io_sched] PID:%d (%s) waited %llu ns for I/O\n",
+		 current->pid, current->comm,
+		 (unsigned long long)delta);
+#endif
+
+	current->in_iowait = old_iowait;
+}
+EXPORT_SYMBOL(io_schedule_complete);
+
+#ifdef CONFIG_NUMA
+
+int numa_cpu_rmap_balance(struct cpu_rmap *rmap)
+{
+	int cpu, node;
+	int count = 0;
+
+	if (!rmap)
+		return -EINVAL;
+
+	for_each_online_cpu(cpu) {
+		node = cpu_to_node(cpu);
+		rmap->near[cpu].dist = node_distance(node, numa_node_id());
+		count++;
+	}
+
+	pr_debug("[rmap] NUMA rebalance updated %d CPUs\n", count);
+	return 0;
+}
+EXPORT_SYMBOL(numa_cpu_rmap_balance);
+#endif /* CONFIG_NUMA */
+
+
+#ifdef CONFIG_LOCK_STAT
+
+struct lockstat_info {
+	u64 acquire_count;
+	u64 contention_count;
+	u64 total_wait_ns;
+};
+
+static DEFINE_PER_CPU(struct lockstat_info, cpu_lockstat);
+
+void sched_lockstat_acquire_start(void)
+{
+	struct lockstat_info *info = this_cpu_ptr(&cpu_lockstat);
+	info->acquire_count++;
+}
+
+void sched_lockstat_contention(u64 wait_ns)
+{
+	struct lockstat_info *info = this_cpu_ptr(&cpu_lockstat);
+	info->contention_count++;
+	info->total_wait_ns += wait_ns;
+}
+#endif /* CONFIG_LOCK_STAT */
+
+#ifdef CONFIG_PROC_FS
+
+static int sched_diag_show(struct seq_file *m, void *v)
+{
+	int cpu;
+
+	seq_puts(m, "=== Scheduler Diagnostics ===\n");
+	for_each_online_cpu(cpu) {
+		struct sched_diag *d = &per_cpu(cpu_sched_diag, cpu);
+		u64 avg_wait = 0;
+
+		if (d->io_wait_count)
+			avg_wait = div64_u64(d->total_io_wait_ns, d->io_wait_count);
+
+		seq_printf(m,
+			"CPU %d: I/O waits=%llu, total=%llu ns, avg=%llu ns, switches=%llu\n",
+			cpu,
+			(unsigned long long)d->io_wait_count,
+			(unsigned long long)d->total_io_wait_ns,
+			(unsigned long long)avg_wait,
+			(unsigned long long)d->rq_switch_count);
+	}
+
+#ifdef CONFIG_LOCK_STAT
+	for_each_online_cpu(cpu) {
+		struct lockstat_info *l = &per_cpu(cpu_lockstat, cpu);
+		seq_printf(m,
+			"CPU %d: locks=%llu, contended=%llu, total_wait=%llu ns\n",
+			cpu,
+			(unsigned long long)l->acquire_count,
+			(unsigned long long)l->contention_count,
+			(unsigned long long)l->total_wait_ns);
+	}
+#endif
+
+	return 0;
+}
+
+static int sched_diag_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, sched_diag_show, NULL);
+}
+
+static const struct proc_ops sched_diag_fops = {
+	.proc_open	= sched_diag_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
+static int __init sched_diag_init(void)
+{
+	struct sched_diag *d;
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		d = &per_cpu(cpu_sched_diag, cpu);
+		raw_spin_lock_init(&d->lock);
+	}
+
+	proc_create("sched_diag", 0444, NULL, &sched_diag_fops);
+	pr_info("sched_diag: /proc/sched_diag registered\n");
+	return 0;
+}
+fs_initcall(sched_diag_init);
 
 
 // TBC

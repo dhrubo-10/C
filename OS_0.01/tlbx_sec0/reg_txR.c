@@ -384,91 +384,100 @@ void add_virt_timer_periodic(struct vtimer_list *timer)
 	__add_vtimer(timer, 1);
 }
 EXPORT_SYMBOL(add_virt_timer_periodic);
-
+/*
+ * Modified virtual timer.
+ * Returns 1 if the timer was pending and modified, 0 otherwise.
+ */
 static int __mod_vtimer(struct vtimer_list *timer, u64 expires, int periodic)
 {
 	unsigned long flags;
-	int rc;
+	int was_pending;
 
 	BUG_ON(!timer->function);
 
-	if (timer->expires == expires && vtimer_pending(timer))
-		return 1;
 	spin_lock_irqsave(&virt_timer_lock, flags);
-	rc = vtimer_pending(timer);
-	if (rc)
+
+	/* Check if timer was already active */
+	was_pending = vtimer_pending(timer);
+	if (was_pending)
 		list_del_init(&timer->entry);
+
+	/*
+	 * For periodic timers, store the interval duration.
+	 * For one-shot timers, interval = 0.
+	 */
 	timer->interval = periodic ? expires : 0;
-	timer->expires = expires;
+	timer->expires  = expires;
+
 	internal_add_vtimer(timer);
 	spin_unlock_irqrestore(&virt_timer_lock, flags);
-	return rc;
+
+	return was_pending;
 }
 
-/*
- * returns whether it has modified a pending timer (1) or not (0)
- */
 int mod_virt_timer(struct vtimer_list *timer, u64 expires)
 {
 	return __mod_vtimer(timer, expires, 0);
 }
 EXPORT_SYMBOL(mod_virt_timer);
 
-/*
- * returns whether it has modified a pending timer (1) or not (0)
- */
 int mod_virt_timer_periodic(struct vtimer_list *timer, u64 expires)
 {
 	return __mod_vtimer(timer, expires, 1);
 }
 EXPORT_SYMBOL(mod_virt_timer_periodic);
 
-/*
- * Delete a virtual timer.
- *
- * returns whether the deleted timer was pending (1) or not (0)
- */
 int del_virt_timer(struct vtimer_list *timer)
 {
 	unsigned long flags;
+	int was_pending;
 
-	if (!vtimer_pending(timer))
-		return 0;
 	spin_lock_irqsave(&virt_timer_lock, flags);
-	list_del_init(&timer->entry);
+	was_pending = vtimer_pending(timer);
+	if (was_pending)
+		list_del_init(&timer->entry);
 	spin_unlock_irqrestore(&virt_timer_lock, flags);
-	return 1;
+
+	return was_pending;
 }
 EXPORT_SYMBOL(del_virt_timer);
 
-  /* Start the virtual CPU timer on the current CPU.*/
- 
+/*
+ * Initialize the virtual CPU timer system on the current CPU.
+ */
 void vtime_init(void)
 {
-	/* set initial cpu timer */
+	/* Set initial CPU timer slice */
 	set_vtimer(VTIMER_MAX_SLICE);
-	/* Setup initial MT scaling values */
+
+	/* Initialize multithread (MT) scaling parameters if supported */
 	if (smp_cpu_mtid) {
-		__this_cpu_write(mt_scaling_jiffies, jiffies);
+		__this_cpu_write(mt_scaling_jiffies, jiffies_64);
 		__this_cpu_write(mt_scaling_mult, 1);
 		__this_cpu_write(mt_scaling_div, 1);
 		stcctm(MT_DIAG, smp_cpu_mtid + 1, this_cpu_ptr(mt_cycles));
 	}
 }
+EXPORT_SYMBOL(vtime_init);
 
+/*
+ * Example configuration reader for device-specific setup.
+ * Reads "cache-line-size" from device tree.
+ */
 static int do_account_vtime(struct device_node *np)
 {
+	u32 cache_line_size;
 	int ret;
 
-	ret = of_property_read_u32(np, "cache-line-size", &mt_scaling_div.mod_virt_timer_periodic);
+	ret = of_property_read_u32(np, "cache-line-size", &cache_line_size);
 	if (ret) {
-		pr_err("Failed to get cache-line-size, defaulting to 64 bytes\n");
-		return ret;
+		pr_warn("Failed to read 'cache-line-size', defaulting to 64 bytes\n");
+		cache_line_size = 64;
 	}
 
-	if (ax45mp_priv.ax45mp_cache_line_size != AX45MP_CACHE_LINE_SIZE) {
-		pr_err("Expected cache-line-size to be 64 bytes (found:%u)\n",
-		       ax45mp_priv.ax45mp_cache_line_size);
+	if (cache_line_size != 64) {
+		pr_err("Expected cache-line-size to be 64 bytes (found: %u)\n",
+		       cache_line_size);
 		return -EINVAL;
 	}
 

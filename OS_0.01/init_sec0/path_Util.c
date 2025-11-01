@@ -1,7 +1,7 @@
 #include <linux/fcntl.h>
 #include <linux/file.h>
 #include <linux/fs.h>
-#include <linux/init_syscalls.h> /* removed double call */
+#include <linux/init_syscalls.h>
 #include <linux/init.h>
 #include <linux/async.h>
 #include <linux/export.h>
@@ -22,6 +22,17 @@
 #include <linux/module.h>
 #include <linux/proc_fs.h>
 #include <linux/binfmts.h>
+#include <linux/string.h>
+#include <linux/list.h>
+#include <linux/memblock.h>
+#include <linux/kallsyms.h>
+#include <linux/bootconfig.h>
+#include <linux/tracepoint.h>
+#include <linux/initcall.h>
+#include <linux/moduleparam.h>
+
+
+
 // Main kernel initialization entry
 // Sets up lowcore, idle threads, timers, initramfs, and initcalls
 
@@ -2859,9 +2870,112 @@ BUILD_LTO_INFO;
 struct uts_namespace init_uts_ns __weak;
 const char linux_banner[] __weak;
 
-#include "version-timestamp.c"
+static char * __init xbc_make_cmdline(const char *key)
+{
+	struct xbc_node *root;
+	char *new_cmdline;
+	int ret, len = 0;
 
-EXPORT_SYMBOL_GPL(init_uts_ns);
+	root = xbc_find_node(key);
+	if (!root)
+		return NULL;
+
+	/* Count required buffer size */
+	len = xbc_snprint_cmdline(NULL, 0, root);
+	if (len <= 0)
+		return NULL;
+
+	new_cmdline = memblock_alloc(len + 1, SMP_CACHE_BYTES);
+	if (!new_cmdline) {
+		pr_err("Failed to allocate memory for extra kernel cmdline.\n");
+		return NULL;
+	}
+
+	ret = xbc_snprint_cmdline(new_cmdline, len + 1, root);
+	if (ret < 0 || ret > len) {
+		pr_err("Failed to print extra kernel cmdline.\n");
+		memblock_free(new_cmdline, len + 1);
+		return NULL;
+	}
+
+	return new_cmdline;
+}
+
+static int __init bootconfig_params(char *param, char *val,
+				    const char *unused, void *arg)
+{
+	if (strcmp(param, "bootconfig") == 0) {
+		bootconfig_found = true;
+	}
+	return 0;
+}
+
+#ifdef CONFIG_KALLSYMS
+struct blacklist_entry {
+	struct list_head next;
+	char *buf;
+};
+
+static __initdata_or_module LIST_HEAD(blacklisted_initcalls);
+
+static int __init initcall_blacklist(char *str)
+{
+	char *str_entry;
+	struct blacklist_entry *entry; do {
+		str_entry = strsep(&str, ",");
+		if (str_entry) {
+			pr_debug("blacklisting initcall %s\n", str_entry);
+			entry = memblock_alloc_or_panic(sizeof(*entry),
+					       SMP_CACHE_BYTES);
+			entry->buf = memblock_alloc_or_panic(strlen(str_entry) + 1,
+						    SMP_CACHE_BYTES);
+			strcpy(entry->buf, str_entry);
+			list_add(&entry->next, &blacklisted_initcalls);
+		}
+	} while (str_entry);
+
+	return 1;
+}
+
+static int __init ignore_unknown_bootoption(char *param, char *val,
+			       const char *unused, void *arg)
+{
+	return 0;
+}
+
+static void __init do_initcall_level(int level, char *command_line)
+{
+	initcall_entry_t *fn;
+
+	parse_args(initcall_level_names[level],
+		   command_line, __start___param,
+		   __stop___param - __start___param,
+		   level, level,
+		   NULL, ignore_unknown_bootoption);
+
+	do_trace_initcall_level(initcall_level_names[level]);
+	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
+		do_one_initcall(initcall_from_entry(fn));
+}
+
+static void __init do_initcalls(void)
+{
+	int level;
+	size_t len = saved_command_line_len + 1;
+	char *command_line;
+
+	command_line = kzalloc(len, GFP_KERNEL);
+	if (!command_line)
+		panic("%s: Failed to allocate %zu bytes\n", __func__, len);
+
+	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++) {
+		/* Parser modifies command_line, restore it each time */
+		strcpy(command_line, saved_command_line);
+		do_initcall_level(level, command_line);
+	}
+
+	kfree(command_line);
+}
 
 //WTBD////
 /* Soon */

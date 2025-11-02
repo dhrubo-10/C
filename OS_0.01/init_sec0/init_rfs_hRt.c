@@ -34,6 +34,30 @@
 #include <linux/lockdep_api.h>
 #include <linux/hardirq.h>
 #include <linux/softirq.h>
+#include <linux/sched.h>
+#include <linux/sched/task.h>
+#include <linux/sched/debug.h>
+#include <linux/sched/clock.h>
+#include <linux/sched/idle.h>
+#include <linux/sched/topology.h>
+#include <linux/sched/isolation.h>
+#include <linux/sched/stat.h>
+#include <linux/rcupdate.h>
+#include <linux/rculist.h>
+#include <linux/spinlock.h>
+#include <linux/lockdep.h>
+#include <linux/llist.h>
+#include <linux/delayacct.h>
+#include <linux/cpumask.h>
+#include <linux/psi.h>
+#include <linux/irqflags.h>
+#include <linux/tracepoint-defs.h>
+#include <linux/smp.h>
+#include <linux/bug.h>
+#include <linux/kernel_stat.h>
+#include <trace/events/sched.h>
+#include "core.h"
+
 
 static struct file *in_file, *out_file;
 static loff_t in_pos, out_pos;
@@ -783,6 +807,9 @@ void sched_mm_cid_fork(struct task_struct *t)
 }
 #endif /* CONFIG_SCHED_MM_CID */
 
+
+
+
 #ifdef CONFIG_SCHED_CLASS_EXT
 void sched_deq_and_put_task(struct task_struct *p, int queue_flags,
 			    struct sched_enq_and_set_ctx *ctx)
@@ -817,5 +844,266 @@ void sched_enq_and_set_task(struct sched_enq_and_set_ctx *ctx)
 		set_next_task(rq, ctx->p);
 }
 #endif 
+
+static unsigned long sched_core_clone_cookie(struct task_struct *p)
+{
+	unsigned long cookie, flags;
+
+	raw_spin_lock_irqsave(&p->pi_lock, flags);
+	cookie = sched_core_get_cookie(p->core_cookie);
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+
+	return cookie;
+}
+
+void sched_core_fork(struct task_struct *p)
+{
+	RB_CLEAR_NODE(&p->core_node);
+	p->core_cookie = sched_core_clone_cookie(current);
+}
+
+void sched_core_free(struct task_struct *p)
+{
+	sched_core_put_cookie(p->core_cookie);
+}
+
+static void __sched_core_set(struct task_struct *p, unsigned long cookie)
+{
+	cookie = sched_core_get_cookie(cookie);
+	cookie = sched_core_update_cookie(p, cookie);
+	sched_core_put_cookie(cookie);
+}
+
+static int ttwu_runnable(struct task_struct *p, int wake_flags)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+	int ret = 0;
+
+	rq = __task_rq_lock(p, &rf);
+	if (task_on_rq_queued(p)) {
+		update_rq_clock(rq);
+		if (p->se.sched_delayed)
+			enqueue_task(rq, p, ENQUEUE_NOCLOCK | ENQUEUE_DELAYED);
+		if (!task_on_cpu(rq, p)) {
+			/*
+			 * When on_rq && !on_cpu the task is preempted, see if
+			 * it should preempt the task that is current now.
+			 */
+			wakeup_preempt(rq, p, wake_flags);
+		}
+		ttwu_do_wakeup(p);
+		ret = 1;
+	}
+	__task_rq_unlock(rq, &rf);
+
+	return ret;
+}
+
+void sched_ttwu_pending(void *arg)
+{
+	struct llist_node *llist = arg;
+	struct rq *rq = this_rq();
+	struct task_struct *p, *t;
+	struct rq_flags rf;
+
+	if (!llist)
+		return;
+
+	rq_lock_irqsave(rq, &rf);
+	update_rq_clock(rq);
+
+	llist_for_each_entry_safe(p, t, llist, wake_entry.llist) {
+		if (WARN_ON_ONCE(p->on_cpu))
+			smp_cond_load_acquire(&p->on_cpu, !VAL);
+
+		if (WARN_ON_ONCE(task_cpu(p) != cpu_of(rq)))
+			set_task_cpu(p, cpu_of(rq));
+
+		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
+	}
+
+
+	WRITE_ONCE(rq->ttwu_pending, 0);
+	rq_unlock_irqrestore(rq, &rf);
+}
+
+static inline void ttwu_do_wakeup(struct task_struct *p)
+{
+	WRITE_ONCE(p->__state, TASK_RUNNING);
+	trace_sched_wakeup(p);
+}
+
+static void
+ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
+		 struct rq_flags *rf)
+{
+	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
+
+	lockdep_assert_rq_held(rq);
+
+	if (p->sched_contributes_to_load)
+		rq->nr_uninterruptible--;
+
+	if (wake_flags & WF_RQ_SELECTED)
+		en_flags |= ENQUEUE_RQ_SELECTED;
+	if (wake_flags & WF_MIGRATED)
+		en_flags |= ENQUEUE_MIGRATED;
+	else
+	if (p->in_iowait) {
+		delayacct_blkio_end(p);
+		atomic_dec(&task_rq(p)->nr_iowait);
+	}
+
+	activate_task(rq, p, en_flags);
+	wakeup_preempt(rq, p, wake_flags);
+
+	ttwu_do_wakeup(p);
+
+	if (p->sched_class->task_woken) {
+
+		rq_unpin_lock(rq, rf);
+		p->sched_class->task_woken(rq, p);
+		rq_repin_lock(rq, rf);
+	}
+
+	if (rq->idle_stamp) {
+		u64 delta = rq_clock(rq) - rq->idle_stamp;
+		u64 max = 2*rq->max_idle_balance_cost;
+
+		update_avg(&rq->avg_idle, delta);
+
+		if (rq->avg_idle > max)
+			rq->avg_idle = max;
+
+		rq->idle_stamp = 0;
+	}
+}
+
+static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+{
+	struct rq *rq = cpu_rq(cpu);
+
+	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
+
+	WRITE_ONCE(rq->ttwu_pending, 1);
+#ifdef CONFIG_SMP
+	__smp_call_single_queue(cpu, &p->wake_entry.llist);
+#endif
+}
+
+void wake_up_if_idle(int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+
+	guard(rcu)();
+	if (is_idle_task(rcu_dereference(rq->curr))) {
+		guard(rq_lock_irqsave)(rq);
+		if (is_idle_task(rq->curr))
+			resched_curr(rq);
+	}
+}
+
+bool cpus_equal_capacity(int this_cpu, int that_cpu)
+{
+	if (!sched_asym_cpucap_active())
+		return true;
+
+	if (this_cpu == that_cpu)
+		return true;
+
+	return arch_scale_cpu_capacity(this_cpu) == arch_scale_cpu_capacity(that_cpu);
+}
+
+bool cpus_share_cache(int this_cpu, int that_cpu)
+{
+	if (this_cpu == that_cpu)
+		return true;
+
+	return per_cpu(sd_llc_id, this_cpu) == per_cpu(sd_llc_id, that_cpu);
+}
+
+static bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+{
+	if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(p, cpu)) {
+		sched_clock_cpu(cpu); /* Sync clocks across CPUs */
+		__ttwu_queue_wakelist(p, cpu, wake_flags);
+		return true;
+	}
+
+	return false;
+}
+
+static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
+{
+	struct rq *rq = cpu_rq(cpu);
+	struct rq_flags rf;
+
+	if (ttwu_queue_wakelist(p, cpu, wake_flags))
+		return;
+
+	rq_lock(rq, &rf);
+	update_rq_clock(rq);
+	ttwu_do_activate(rq, p, wake_flags, &rf);
+	rq_unlock(rq, &rf);
+}
+
+int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+{
+	guard(preempt)();
+	int cpu, success = 0;
+
+	wake_flags |= WF_TTWU;
+
+	if (p == current) {
+		
+		WARN_ON_ONCE(p->se.sched_delayed);
+		if (!ttwu_state_match(p, state, &success))
+			goto out;
+
+		trace_sched_waking(p);
+		ttwu_do_wakeup(p);
+		goto out;
+	}
+
+	scoped_guard (raw_spinlock_irqsave, &p->pi_lock) {
+		smp_mb__after_spinlock();
+		if (!ttwu_state_match(p, state, &success))
+			break;
+
+		trace_sched_waking(p);
+		smp_rmb();
+		if (READ_ONCE(p->on_rq) && ttwu_runnable(p, wake_flags))
+			break;
+
+		smp_acquire__after_ctrl_dep();
+		WRITE_ONCE(p->__state, TASK_WAKING);
+
+		if (smp_load_acquire(&p->on_cpu) &&
+		    ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
+			break;
+
+		smp_cond_load_acquire(&p->on_cpu, !VAL);
+
+		cpu = select_task_rq(p, p->wake_cpu, &wake_flags);
+		if (task_cpu(p) != cpu) {
+			if (p->in_iowait) {
+				delayacct_blkio_end(p);
+				atomic_dec(&task_rq(p)->nr_iowait);
+			}
+
+			wake_flags |= WF_MIGRATED;
+			psi_ttwu_dequeue(p);
+			set_task_cpu(p, cpu);
+		}
+
+		ttwu_queue(p, cpu, wake_flags);
+	}
+out:
+	if (success)
+		ttwu_stat(p, task_cpu(p), wake_flags);
+
+	return success;
+}
 
 // TBC

@@ -14,6 +14,11 @@
 #include <linux/sched/task.h>
 #include <linux/sched/topology.h>
 #include <linux/atomic.h>
+#include <linux/cpumask_api.h>
+#include <linux/ctype.h>
+#include <linux/file.h>
+#include <linux/fs_api.h>
+#include <linux/hrtimer_api.h>
 
 
 struct rq;
@@ -29,8 +34,6 @@ struct cpuidle_state;
 
 #include <asm/barrier.h>
 
-#include "cpupri.h"
-#include "cpudeadline.h"
 
 /* task_struct::on_rq states: */
 #define TASK_ON_RQ_QUEUED	1
@@ -83,3 +86,29 @@ static inline int task_has_dl_policy(struct task_struct *p)
 {
 	return dl_policy(p->policy);
 }
+
+extern void init_dl_bw(struct dl_bw *dl_b);
+extern int  sched_dl_global_validate(void);
+extern void sched_dl_do_global(void);
+extern int  sched_dl_overflow(struct task_struct *p, int policy, const struct sched_attr *attr);
+extern void __setparam_dl(struct task_struct *p, const struct sched_attr *attr);
+extern void __getparam_dl(struct task_struct *p, struct sched_attr *attr);
+extern bool __checkparam_dl(const struct sched_attr *attr);
+extern bool dl_param_changed(struct task_struct *p, const struct sched_attr *attr);
+extern int  dl_cpuset_cpumask_can_shrink(const struct cpumask *cur, const struct cpumask *trial);
+extern int  dl_bw_deactivate(int cpu);
+extern s64 dl_scaled_delta_exec(struct rq *rq, struct sched_dl_entity *dl_se, s64 delta_exec);
+extern void dl_server_update(struct sched_dl_entity *dl_se, s64 delta_exec);
+extern void dl_server_start(struct sched_dl_entity *dl_se);
+extern void dl_server_stop(struct sched_dl_entity *dl_se);
+extern void dl_server_init(struct sched_dl_entity *dl_se, struct rq *rq,
+		    dl_server_has_tasks_f has_tasks,
+		    dl_server_pick_f pick_task);
+extern void sched_init_dl_servers(void);
+
+extern void dl_server_update_idle_time(struct rq *rq,
+		    struct task_struct *p);
+extern void fair_server_init(struct rq *rq);
+extern void __dl_server_attach_root(struct sched_dl_entity *dl_se, struct rq *rq);
+extern int dl_server_apply_params(struct sched_dl_entity *dl_se,
+		    u64 runtime, u64 period, bool init);

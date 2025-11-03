@@ -1,606 +1,602 @@
-#include <math.h>
-#include <stdint.h>
-#include <string.h>
+/*
+ * kernel-space floating-point emulator
+ * Rewritten for kernel-space integration by lyli.
+ */
 
-#ifdef HAVE_POWF
-float powf(float x, float y);
-#else
-# define powf(x,y) (float)pow((double)x, (double)y)
-#endif
 
-#define XUL	170141163178059628080016879768632819712.0
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <linux/slab.h>
+#include <linux/errno.h>
+#include <linux/bitops.h>
+#include <linux/printk.h>
+#include <linux/float.h>
 
-typedef struct {
-   unsigned frac1:7;
-   unsigned exp:  8;
-   unsigned sign: 1;
-   unsigned frac2: 16;
-} pdpfloat;
+typedef float FLOAT;
 
-FLOAT  fregs[8];
-int FPC=0;
-int FPZ=0;
-int FPN=0;
-int FPV=0;
-int FPMODE=0;
-int INTMODE=0;
+#define XUL 170141163178059628080016879768632819712.0f 
 
-FLOAT Srcflt;
-pdpfloat *fladdr;
-int   AC;
-int32_t srclong;
-int32_t dstlong;
-static char *buf, *buf2;
+struct pdpfloat {
+    u16 frac_hi; 
+};
 
-static void from11float(FLOAT *out, pdpfloat *in)
+struct pdp_raw {
+    u16 lo; 
+    u16 hi; 
+};
+
+/* Externs required from main emulator */
+extern u16 ispace[];
+extern u16 dspace[];
+extern s32 regs[];
+extern int DST_MODE;
+extern int DST_REG;
+extern int PC;
+
+extern void ll_word(u16 addr, u16 *out);
+extern void lli_word(u16 addr, u16 *out);
+extern void copylong(u16 dst, u16 src);
+extern void load_src(void);
+extern void store_dst(void);
+
+extern u16 srcword;
+extern u16 dstword;
+extern s32 srclong;
+extern s32 dstlong;
+
+/* FPU condition flags */
+static int FPC = 0;
+static int FPZ = 0;
+static int FPN = 0;
+static int FPV = 0;
+static int FPMODE = 0;
+static int INTMODE = 0;
+
+static FLOAT fregs[8];
+static FLOAT Srcflt;
+static struct pdp_raw tmp_pdp;
+static int AC = 0;
+static char *kfloat_buf = NULL;
+
+/* Compose pdp_raw from bit components */
+static inline struct pdp_raw pdp_make(u8 sign, u8 exp, u16 frac1, u16 frac2)
 {
- int32_t  exponent;
- u_int32_t fraction;
- FLOAT z;
-
- exponent= in->exp - 128 - 24;
- fraction= (in->frac1 << 16) + in->frac2 + 8388608;
-
- z= powf(2.0, (float)exponent);
- *out= (float)fraction * z;
- if (in->sign) *out= -(*out);
+    struct pdp_raw r;
+    r.hi = (u16)(((sign & 0x1) << 15) | ((exp & 0xff) << 7) | (frac1 & 0x7f));
+    r.lo = frac2;
+    return r;
 }
 
-static void to11float(FLOAT *in, pdpfloat *out)
+/* Extract fields from pdp_raw */
+static inline void pdp_extract(const struct pdp_raw *r, u8 *sign, u8 *exp, u16 *frac1, u16 *frac2)
 {
-  int32_t  exponent=129;
-  u_int32_t fraction;
-  FLOAT infloat= *in;
-
-  if (infloat < 0.0) { out->sign=1; infloat= -infloat; } 
-  else out->sign=0;
-
-  if (infloat==0.0) { out->frac1=0; out->frac2=0; out->exp=0; return; }
-
-  while (infloat >= 2.0) { infloat *= 0.5; exponent++; }
-  while (infloat < 1.0)	 { infloat *= 2.0; exponent--; }
-
-  infloat= infloat - 1.0;
-  fraction= (int)(infloat * 8388608.0);
-  out->frac2= fraction & 0xffff;
-  out->frac1= (fraction>>16);
-  out->exp= exponent;
+    u16 hi = r->hi;
+    *sign = (hi >> 15) & 0x1;
+    *exp  = (hi >> 7) & 0xff;
+    *frac1 = hi & 0x7f;
+    *frac2 = r->lo;
 }
 
-static struct { u_int16_t lo; u_int16_t hi; } intpair;
+/* Compute 2^n using repeated multiplication */
+static FLOAT pow2f_by_int(int n)
+{
+    FLOAT r = 1.0f;
+    if (n > 0) while (n-- > 0) r *= 2.0f;
+    else while (n++ < 0) r *= 0.5f;
+    return r;
+}
 
+/* Convert PDP-format float -> IEEE float */
+static void from11float(FLOAT *out, const struct pdp_raw *in_raw)
+{
+    u8 sign, exp;
+    u16 frac1, frac2;
+    pdp_extract(in_raw, &sign, &exp, &frac1, &frac2);
+
+    if (exp == 0 && frac1 == 0 && frac2 == 0) {
+        *out = 0.0f;
+        return;
+    }
+
+    int32_t exponent = (int32_t)exp - 128 - 24;
+    uint32_t fraction = ((uint32_t)frac1 << 16) | (uint32_t)frac2;
+    fraction += 8388608U; 
+
+    FLOAT z = pow2f_by_int(exponent);
+    *out = (FLOAT)fraction * z;
+    if (sign) *out = -(*out);
+}
+
+/* Convert IEEE float -> PDP-format float */
+static void to11float(const FLOAT *in, struct pdp_raw *out_raw)
+{
+    FLOAT infloat = *in;
+    u8 sign = 0;
+    if (infloat < 0.0f) { sign = 1; infloat = -infloat; }
+    if (infloat == 0.0f) { *out_raw = pdp_make(0,0,0,0); return; }
+
+    int exponent = 129;
+    while (infloat >= 2.0f) { infloat *= 0.5f; exponent++; }
+    while (infloat < 1.0f) { infloat *= 2.0f; exponent--; }
+
+    infloat -= 1.0f;
+    uint32_t fraction = (uint32_t)(infloat * 8388608.0f);
+    u16 frac2 = (u16)(fraction & 0xffff);
+    u16 frac1 = (u16)((fraction >> 16) & 0x7f);
+    *out_raw = pdp_make(sign, (u8)exponent, frac1, frac2);
+}
+
+/* Handle illegal state */
+static void illegal(void) { pr_err("kfloat: illegal addressing or state\n"); }
+
+/* Load float into Srcflt based on DST_MODE */
 static void load_flt(void)
 {
-    u_int16_t indirect,addr;
-    u_int16_t *intptr;
+    u16 indirect, addr;
+    u16 *intptr;
 
-    switch (DST_MODE) {
+ switch (DST_MODE) {
     case 0:
-	Srcflt = fregs[DST_REG];
-	fladdr=NULL; return;
+        if (DST_REG < 0 || DST_REG >= ARRAY_SIZE(fregs)) {
+            Srcflt = 0.0f;
+            return;
+        }
+        Srcflt = fregs[DST_REG];
+        return;
+
     case 1:
-	if (DST_REG == PC) {
-	    intptr = (u_int16_t *)&ispace[regs[DST_REG]];
-	    intpair.lo= *intptr;
-	    intpair.hi=0;
-	    fladdr= (pdpfloat *)&intpair;
-	} else fladdr = (pdpfloat *)&dspace[regs[DST_REG]];
-	from11float(&Srcflt, fladdr);
-	return;
+        if (DST_REG == PC) {
+            intptr = &ispace[regs[DST_REG]];
+            tmp_pdp.lo = *intptr;
+            tmp_pdp.hi = 0;
+            from11float(&Srcflt, &tmp_pdp);
+        } else {
+            addr = regs[DST_REG];
+            from11float(&Srcflt, (struct pdp_raw *)&dspace[addr]);
+        }
+        return;
+
     case 2:
-	if (DST_REG == PC) {
-	    intptr = (u_int16_t *)&ispace[regs[DST_REG]];
-	    intpair.lo= *intptr;
-	    intpair.hi=0;
-	    fladdr= (pdpfloat *)&intpair;
-	    from11float(&Srcflt, fladdr);
-	    regs[DST_REG] += 2;
-	} else {
-	    fladdr = (pdpfloat *)&dspace[regs[DST_REG]];
-	    from11float(&Srcflt, fladdr);
-	    if (FPMODE) regs[DST_REG] += 8;
-	    else regs[DST_REG] += 4;
-	}
-	return;
+        if (DST_REG == PC) {
+            intptr = &ispace[regs[DST_REG]];
+            tmp_pdp.lo = *intptr;
+            tmp_pdp.hi = 0;
+            from11float(&Srcflt, &tmp_pdp);
+            regs[DST_REG] += 2;
+        } else {
+            addr = regs[DST_REG];
+            from11float(&Srcflt, (struct pdp_raw *)&dspace[addr]);
+            regs[DST_REG] += FPMODE ? 8 : 4;
+        }
+        return;
+
     case 3:
-	ll_word(regs[DST_REG], indirect);
-	if (DST_REG == PC) {
-	    intptr = (u_int16_t *)&ispace[indirect];
-	    intpair.lo= *intptr;
-	    intpair.hi=0;
-	    fladdr= (pdpfloat *)&intpair;
-	    from11float(&Srcflt, fladdr);
-	    regs[DST_REG] += 2;
-	} else {
-	    fladdr = (pdpfloat *)&dspace[indirect];
-	    from11float(&Srcflt, fladdr);
-	    if (FPMODE) regs[DST_REG] += 8;
-	    else regs[DST_REG] += 4;
-	}
-	return;
+        ll_word(regs[DST_REG], &indirect);
+        from11float(&Srcflt, (struct pdp_raw *)&dspace[indirect]);
+        regs[DST_REG] += FPMODE ? 8 : 4;
+        return;
+
     case 4:
-	if (FPMODE) regs[DST_REG] -= 8;
-	else regs[DST_REG] -= 4;
-	fladdr = (pdpfloat *)&dspace[regs[DST_REG]];
-	from11float(&Srcflt, fladdr);
-	return;
+        regs[DST_REG] -= FPMODE ? 8 : 4;
+        addr = regs[DST_REG];
+        from11float(&Srcflt, (struct pdp_raw *)&dspace[addr]);
+        return;
+
     case 5:
-	if (FPMODE) regs[DST_REG] -= 8;
-	else regs[DST_REG] -= 4;
-	ll_word(regs[DST_REG], indirect);
-	fladdr = (pdpfloat *)&dspace[indirect];
-	from11float(&Srcflt, fladdr);
-	return;
+        regs[DST_REG] -= FPMODE ? 8 : 4;
+        ll_word(regs[DST_REG], &indirect);
+        from11float(&Srcflt, (struct pdp_raw *)&dspace[indirect]);
+        return;
+
     case 6:
-	lli_word(regs[PC], indirect);
-	regs[PC] += 2;
-	indirect= regs[DST_REG] + indirect;
-	fladdr = (pdpfloat *)&dspace[indirect];
-	from11float(&Srcflt, fladdr);
-	return;
+        lli_word(regs[PC], &indirect);
+        regs[PC] += 2;
+        indirect = regs[DST_REG] + indirect;
+        from11float(&Srcflt, (struct pdp_raw *)&dspace[indirect]);
+        return;
+
     case 7:
-	lli_word(regs[PC], indirect);
-	regs[PC] += 2;
-	indirect = regs[DST_REG] + indirect;
-	ll_word(indirect, addr);
-	fladdr = (pdpfloat *)&dspace[addr];
-	from11float(&Srcflt, fladdr);
-	return;
-    }
-    illegal();
+        lli_word(regs[PC], &indirect);
+        regs[PC] += 2;
+        indirect = regs[DST_REG] + indirect;
+        ll_word(indirect, &addr);
+        from11float(&Srcflt, (struct pdp_raw *)&dspace[addr]);
+        return;
 }
 
+illegal();
+
+
+/* Save Srcflt to memory or register */
 static void save_flt(void)
 {
-    u_int16_t indirect;
-    u_int16_t addr;
-    pdpfloat *fladdr;
+    u16 indirect, addr;
+    struct pdp_raw local_pdp;
 
     switch (DST_MODE) {
-    case 0:
-	fregs[DST_REG] = Srcflt;
-	return;
-    case 1:
-	fladdr = (pdpfloat *)&dspace[regs[DST_REG]];
-	to11float(&Srcflt, fladdr);
-	return;
-    case 2:
-	fladdr = (pdpfloat *)&dspace[regs[DST_REG]];
-	to11float(&Srcflt, fladdr);
-	if (DST_REG == PC) regs[DST_REG] += 2;
-	else if (FPMODE) regs[DST_REG] += 8;
-	else regs[DST_REG] += 4;
-	return;
-    case 3:
-	ll_word(regs[DST_REG], indirect);
-	fladdr = (pdpfloat *)&dspace[indirect];
-	to11float(&Srcflt, fladdr);
-	if (DST_REG == PC) regs[DST_REG] += 2;
-	else if (FPMODE) regs[DST_REG] += 8;
-	else regs[DST_REG] += 4;
-	return;
-    case 4:
-	if (FPMODE) regs[DST_REG] -= 8;
-	else regs[DST_REG] -= 4;
-	fladdr = (pdpfloat *)&dspace[regs[DST_REG]];
-	to11float(&Srcflt, fladdr);
-	return;
-    case 5:
-	if (FPMODE) regs[DST_REG] -= 8;
-	else regs[DST_REG] -= 4;
-	ll_word(regs[DST_REG], indirect);
-	fladdr = (pdpfloat *)&dspace[indirect];
-	to11float(&Srcflt, fladdr);
-	return;
-    case 6:
-	lli_word(regs[PC], indirect);
-	regs[PC] += 2;
-	indirect = regs[DST_REG] + indirect;
-	fladdr = (pdpfloat *)&dspace[indirect];
-	to11float(&Srcflt, fladdr);
-	return;
-    case 7:
-	lli_word(regs[PC], indirect);
-	regs[PC] += 2;
-	indirect = regs[DST_REG] + indirect;
-	ll_word(indirect, addr);
-	fladdr = (pdpfloat *)&dspace[addr];
-	to11float(&Srcflt, fladdr);
-	return;
+    case 0: fregs[DST_REG]=Srcflt; return;
+    case 1: 
+        addr=regs[DST_REG]; 
+        to11float(&Srcflt,&local_pdp);
+
+         memcpy(&dspace[addr],&local_pdp,sizeof(local_pdp)); 
+         return;
+    case 2: 
+
+        addr=regs[DST_REG]; 
+        to11float(&Srcflt,&local_pdp);
+
+         memcpy(&dspace[addr],&local_pdp,sizeof(local_pdp)); 
+         regs[DST_REG]+=DST_REG==PC?2:(FPMODE?8:4); 
+         return;
+    case 3: 
+        ll_word(regs[DST_REG],&indirect); 
+        to11float(&Srcflt,&local_pdp); 
+        memcpy(&dspace[indirect],&local_pdp,sizeof(local_pdp)); 
+        regs[DST_REG]+=FPMODE?8:4; 
+        return;
+
+    case 4: 
+        regs[DST_REG]-=FPMODE?8:4; 
+        addr=regs[DST_REG]; to11float(&Srcflt,&local_pdp); 
+        memcpy(&dspace[addr],&local_pdp,sizeof(local_pdp)); 
+        return;
+
+    case 5: 
+        regs[DST_REG]-=FPMODE?8:4; 
+        ll_word(regs[DST_REG],&indirect); 
+        to11float(&Srcflt,&local_pdp); 
+        memcpy(&dspace[indirect],&local_pdp,sizeof(local_pdp)); 
+        return;
+
+    case 6: lli_word(regs[PC],&indirect); regs[PC]+=2; 
+        indirect=regs[DST_REG]+indirect; 
+        to11float(&Srcflt,&local_pdp); 
+        memcpy(&dspace[indirect],&local_pdp,sizeof(local_pdp)); 
+        return;
+
+    case 7: lli_word(regs[PC],&indirect); regs[PC]+=2; 
+        indirect=regs[DST_REG]+indirect; 
+        ll_word(indirect,&addr); 
+        to11float(&Srcflt,&local_pdp); 
+        memcpy(&dspace[addr],&local_pdp,sizeof(local_pdp)); 
+        return;
     }
     illegal();
 }
 
-#define lli_long(addr, word) \
-	{ adptr= (u_int16_t *)&(ispace[addr]); copylong(word, *adptr); } \
-
-#define ll_long(addr, word) \
-	{ adptr= (u_int16_t *)&(dspace[addr]); copylong(word, *adptr); } \
-
-#define sl_long(addr, word) \
-	{ adptr= (u_int16_t *)&(dspace[addr]); copylong(*adptr, word); } \
 
 static void load_long(void)
 {
-    u_int16_t addr, indirect;
+    u16 addr, indirect;
+    switch(DST_MODE){
+    case 0: srclong=regs[DST_REG]; return;
 
-    switch (DST_MODE) {
-    case 0:
-	srclong = regs[DST_REG];
-	return;
-    case 1:
-	addr = regs[DST_REG];
-	if (DST_REG == PC) {
-	    lli_long(addr, srclong)
-	} else {
-	    ll_long(addr, srclong);
-	}
-	return;
-    case 2:
-	addr = regs[DST_REG];
-	if (DST_REG == PC) {
-	    lli_long(addr, srclong)
-	} else {
-	    ll_long(addr, srclong);
-	}
-	regs[DST_REG] += 4;
-	return;
-    case 3:
-	indirect = regs[DST_REG];
-	if (DST_REG == PC) {
-	    lli_word(indirect, addr)
-	} else {
-	    ll_word(indirect, addr);
-	}
-	regs[DST_REG] += 4;
-	ll_long(addr, srclong);
-	return;
-    case 4:
-	regs[DST_REG] -= 4;
-	addr = regs[DST_REG];
-	ll_long(addr, srclong);
-	return;
-    case 5:
-	regs[DST_REG] -= 4;
-	indirect = regs[DST_REG];
-	ll_word(indirect, addr);
-	ll_long(addr, srclong);
-	return;
-    case 6:
-	lli_word(regs[PC], indirect);
-	regs[PC] += 2;
-	addr = regs[DST_REG] + indirect;
-	ll_long(addr, srclong);
-	return;
-    case 7:
-	lli_word(regs[PC], indirect);
-	regs[PC] += 2;
-	indirect = regs[DST_REG] + indirect;
-	ll_word(indirect, addr);
-	ll_long(addr, srclong);
-	return;
+    case 1: addr=regs[DST_REG]; 
+        DST_REG==PC?copylong_from_ispace(`addr,&srclong):copylong_from_dspace(addr,&srclong); 
+        return;
+
+    case 2: addr=regs[DST_REG]; 
+        DST_REG==PC?copylong_from_ispace(addr,&srclong):copylong_from_dspace(addr,&srclong); 
+        regs[DST_REG]+=4; 
+        return;
+
+    case 3: 
+        indirect=regs[DST_REG]; DST_REG==PC?lli_word(indirect,&addr):ll_word(indirect,&addr); 
+        regs[DST_REG]+=4; 
+        copylong_from_dspace(addr,&srclong); 
+        return;
+
+    case 4: 
+        regs[DST_REG]-=4; 
+        addr=regs[DST_REG]; 
+        copylong_from_dspace(addr,&srclong); 
+        return;
+    case 5: 
+        regs[DST_REG]-=4; 
+        ll_word(regs[DST_REG],&addr); 
+        copylong_from_dspace(addr,&srclong); 
+        return;
+    case 6: 
+        lli_word(regs[PC],&indirect); 
+        regs[PC]+=2; 
+        addr=regs[DST_REG]+indirect; 
+        copylong_from_dspace(addr,&srclong); 
+        return;
+
+    case 7: 
+        lli_word(regs[PC],&indirect); 
+        regs[PC]+=2; 
+        indirect=regs[DST_REG]+indirect; 
+        ll_word(indirect,&addr); 
+        copylong_from_dspace(addr,&srclong); 
+        return;
     }
     illegal();
 }
 
 static void store_long(void)
 {
-    u_int16_t addr, indirect;
+    u16 addr, indirect;
 
-    switch (DST_MODE) {
-    case 0:
-	regs[DST_REG]= dstlong;
-	return;
-    case 1:
-	addr = regs[DST_REG];
-	sl_long(addr, dstlong)
-	return;
-    case 2:
-	addr = regs[DST_REG];
-	sl_long(addr, dstlong)
-	regs[DST_REG] += 4;
-	return;
-    case 3:
-	indirect = regs[DST_REG];
-	ll_word(indirect, addr);
-	regs[DST_REG] += 4;
-	sl_long(addr, dstlong);
-	return;
-    case 4:
-	regs[DST_REG] -= 4;
-	addr = regs[DST_REG];
-	sl_long(addr, dstlong);
-	return;
-    case 5:
-	regs[DST_REG] -= 4;
-	indirect = regs[DST_REG];
-	ll_word(indirect, addr);
-	sl_long(addr, dstlong);
-	return;
-    case 6:
-	lli_word(regs[PC], indirect);
-	regs[PC] += 2;
-	addr = regs[DST_REG] + indirect;
-	sl_long(addr, dstlong);
-	return;
-    case 7:
-	lli_word(regs[PC], indirect);
-	regs[PC] += 2;
-	indirect = regs[DST_REG] + indirect;
-	ll_word(indirect, addr);
-	sl_long(addr, dstlong);
-	return;
+    switch(DST_MODE) {
+        case 0:
+            regs[DST_REG] = dstlong;
+            return;
+
+        case 1:
+            addr = regs[DST_REG];
+            copylong_to_dspace(addr, dstlong);
+            return;
+
+        case 2:
+            addr = regs[DST_REG];
+            copylong_to_dspace(addr, dstlong);
+            regs[DST_REG] += 4;
+            return;
+
+        case 3:
+            indirect = regs[DST_REG];
+            ll_word(indirect, &addr);
+            regs[DST_REG] += 4;
+            copylong_to_dspace(addr, dstlong);
+            return;
+
+        case 4:
+            regs[DST_REG] -= 4;
+            addr = regs[DST_REG];
+            copylong_to_dspace(addr, dstlong);
+            return;
+
+        case 5:
+            regs[DST_REG] -= 4;
+            ll_word(regs[DST_REG], &addr);
+            copylong_to_dspace(addr, dstlong);
+            return;
+
+        case 6:
+            lli_word(regs[PC], &indirect);
+            regs[PC] += 2;
+            addr = regs[DST_REG] + indirect;
+            copylong_to_dspace(addr, dstlong);
+            return;
+
+        case 7:
+            lli_word(regs[PC], &indirect);
+            regs[PC] += 2;
+            indirect = regs[DST_REG] + indirect;
+            ll_word(indirect, &addr);
+            copylong_to_dspace(addr, dstlong);
+            return;
     }
+
     illegal();
 }
 
-void fpset()
+/* FPU operations */
+static void fpset(void)
 {
-    switch (ir) {
-	case 0170000:
-	CC_C= FPC; CC_V= FPV;
-	CC_Z= FPZ; CC_N= FPN;
-	return;
-    case 0170001:
-	FPMODE=0; return;
-    case 0170002:
-	INTMODE=0; return;
-    case 0170011:
-	FPMODE=1; return;
-    case 0170012:
-	INTMODE=1; return;
-    default:
-	not_impl();
+}
+
+static void ldf(void)
+{
+    AC = (0 >> 6) & 3;
+    load_flt();
+    fregs[AC] = Srcflt;
+    FPC = 0;
+    FPV = 0;
+    FPZ = (fregs[AC] == 0.0f) ? 1 : 0;
+    FPN = (fregs[AC] < 0.0f) ? 1 : 0;
+}
+
+static void stf(void)
+{
+    AC = (0 >> 6) & 3;
+    Srcflt = fregs[AC];
+    save_flt();
+}
+
+static void clrf(void)
+{
+    AC = (0 >> 6) & 3;
+    Srcflt = 0.0f;
+    save_flt();
+    FPC = 0;
+    FPV = 0;
+    FPZ = 1;
+}
+
+static void addf(void)
+{
+    AC = (0 >> 6) & 3;
+    load_flt();
+    fregs[AC] += Srcflt;
+    FPC = 0;
+    FPV = (fregs[AC] > XUL) ? 1 : 0;
+    FPZ = (fregs[AC] == 0.0f) ? 1 : 0;
+    FPN = (fregs[AC] < 0.0f) ? 1 : 0;
+}
+
+static void subf(void)
+{
+    AC = (0 >> 6) & 3;
+    load_flt();
+    fregs[AC] -= Srcflt;
+    FPC = 0;
+    FPV = (fregs[AC] > XUL) ? 1 : 0;
+    FPZ = (fregs[AC] == 0.0f) ? 1 : 0;
+    FPN = (fregs[AC] < 0.0f) ? 1 : 0;
+}
+
+static void negf(void)
+{
+    load_flt();
+    Srcflt = -Srcflt;
+    save_flt();
+    FPC = 0;
+    FPV = 0;
+    FPZ = (Srcflt == 0.0f) ? 1 : 0;
+    FPN = (Srcflt < 0.0f) ? 1 : 0;
+}
+
+static void absf(void)
+{
+    load_flt();
+    if (Srcflt < 0.0f)
+        Srcflt = -Srcflt;
+    save_flt();
+    FPC = 0;
+    FPV = 0;
+    FPN = 0;
+    FPZ = (Srcflt == 0.0f) ? 1 : 0;
+}
+
+static void mulf(void)
+{
+    AC = (0 >> 6) & 3;
+    load_flt();
+    fregs[AC] *= Srcflt;
+    FPC = 0;
+    FPV = (fregs[AC] > XUL) ? 1 : 0;
+    FPZ = (fregs[AC] == 0.0f) ? 1 : 0;
+    FPN = (fregs[AC] < 0.0f) ? 1 : 0;
+}
+
+static void moddf(void)
+{
+    FLOAT x, y;
+    AC = (0 >> 6) & 3;
+    load_flt();
+    fregs[AC] *= Srcflt;
+    y = fregs[AC];
+
+    if (y > 0.0f)
+        x = (FLOAT)__builtin_floorf(y);
+    else
+        x = (FLOAT)__builtin_ceilf(y);
+
+    if ((AC | 1) < ARRAY_SIZE(fregs))
+        fregs[AC | 1] = x;
+
+    fregs[AC] = y - x;
+
+    FPC = 0;
+    FPV = (fregs[AC] > XUL) ? 1 : 0;
+    FPZ = (fregs[AC] == 0.0f) ? 1 : 0;
+    FPN = (fregs[AC] < 0.0f) ? 1 : 0;
+}
+
+static void divf(void)
+{
+    AC = (0 >> 6) & 3;
+    load_flt();
+    if (Srcflt == 0.0f) {
+        FPV = 1;
+        return;
     }
+    fregs[AC] /= Srcflt;
+    FPC = 0;
+    FPV = (fregs[AC] > XUL) ? 1 : 0;
+    FPZ = (fregs[AC] == 0.0f) ? 1 : 0;
+    FPN = (fregs[AC] < 0.0f) ? 1 : 0;
 }
 
-void ldf()
+static void cmpf(void)
 {
-  AC= (ir >> 6) & 3;
-  load_flt();
-  fregs[AC]= Srcflt;
-  FPC=0; FPV=0; 
-  if (fregs[AC]==0.0) FPZ=1; else FPZ=0;
-  if (fregs[AC]<0.0)  FPN=1; else FPN=0;
+    AC = (0 >> 6) & 3;
+    load_flt();
+    FPC = 0;
+    FPV = 0;
+    FPN = (fregs[AC] > Srcflt) ? 1 : 0;
+    FPZ = (fregs[AC] == Srcflt) ? 1 : 0;
 }
 
-void stf()
+static void tstf(void)
 {
-  AC= (ir >> 6) & 3;
-  Srcflt= fregs[AC];
-  save_flt();
+    AC = (0 >> 6) & 3;
+    load_flt();
+    FPC = 0;
+    FPV = 0;
+    FPN = (Srcflt < 0.0f) ? 1 : 0;
+    FPZ = (Srcflt == 0.0f) ? 1 : 0;
 }
 
-void clrf()
+static void ldfps(void)
 {
-  AC= (ir >> 6) & 3;
-  Srcflt= 0.0;
-  save_flt();
-  FPC= FPZ= FPV= 0; FPZ=1;
+    load_src();
 }
 
-void addf()
+static void stfps(void)
 {
-  AC= (ir >> 6) & 3;
-  load_flt();
-  fregs[AC]+= Srcflt;
-  FPC=0;
-  if (fregs[AC]>XUL)  FPV=1; else FPV=0;
-  if (fregs[AC]==0.0) FPZ=1; else FPZ=0;
-  if (fregs[AC]<0.0)  FPN=1; else FPN=0;
-}
-
-void subf()
-{
-  AC= (ir >> 6) & 3;
-  load_flt();
-  fregs[AC]-= Srcflt;
-  FPC=0;
-  if (fregs[AC]>XUL)  FPV=1; else FPV=0;
-  if (fregs[AC]==0.0) FPZ=1; else FPZ=0;
-  if (fregs[AC]<0.0)  FPN=1; else FPN=0;
-}
-
-void negf()
-{
-  load_flt();
-  fladdr->sign= -(fladdr->sign);
-  FPC=0; FPV=0; 
-  if (Srcflt==0.0) FPZ=1; else FPZ=0;
-  if (Srcflt<0.0)  FPN=1; else FPN=0;
-}
-
-void absf()
-{
-  load_flt();
-  fladdr->sign= 0;
-  FPC=0; FPV=0; FPN=0;
-  if (Srcflt==0.0) FPZ=1; else FPZ=0;
-}
-
-void mulf()
-{
-  AC= (ir >> 6) & 3;
-  load_flt();
-  fregs[AC]*= Srcflt;
-  FPC=0;
-  if (fregs[AC]>XUL)  FPV=1; else FPV=0;
-  if (fregs[AC]==0.0) FPZ=1; else FPZ=0;
-  if (fregs[AC]<0.0)  FPN=1; else FPN=0;
-}
-
-void moddf()
-{
-  FLOAT x,y;
-
-  AC= (ir >> 6) & 3;
-  load_flt();
-  fregs[AC]*= Srcflt; y= fregs[AC];
-  if (y>0.0) x= (FLOAT) floor((double)y);
-  else x= (FLOAT) ceil((double)y);
-  fregs[AC|1]= x;
-
-  y=y-x;  fregs[AC]=y;
-
-  FPC=0;
-  if (fregs[AC]>XUL)  FPV=1; else FPV=0;
-  if (fregs[AC]==0.0) FPZ=1; else FPZ=0;
-  if (fregs[AC]<0.0)  FPN=1; else FPN=0;
-}
-
-void divf()
-{
-  AC= (ir >> 6) & 3;
-  load_flt();
-  fregs[AC]/= Srcflt;
-  FPC=0;
-  if (fregs[AC]>XUL)  FPV=1; else FPV=0;
-  if (fregs[AC]==0.0) FPZ=1; else FPZ=0;
-  if (fregs[AC]<0.0)  FPN=1; else FPN=0;
-}
-
-void cmpf()
-{
-  AC= (ir >> 6) & 3;
-  load_flt();
-  FPC=0; FPV=0;
-  if (fregs[AC]>Srcflt)	 FPN=1; else FPN=0;
-  if (fregs[AC]==Srcflt) FPZ=1; else FPZ=0;
-}
-
-void tstf()
-{
-  AC= (ir >> 6) & 3;
-  load_flt();
-  FPC=0; FPV=0;
-  if (Srcflt<0.0)  FPN=1; else FPN=0;
-  if (Srcflt==0.0) FPZ=1; else FPZ=0;
-}
-
-void ldfps()
-{
-    load_dst();
-    if (dstword & CC_NBIT) CC_N=1;
-    if (dstword & CC_ZBIT) CC_Z=1;
-    if (dstword & CC_VBIT) CC_V=1;
-    if (dstword & CC_CBIT) CC_C=1;
-}
-
-void stfps()
-{
-    srcword=0;
-    if (CC_N) srcword|= CC_NBIT;
-    if (CC_Z) srcword|= CC_ZBIT;
-    if (CC_V) srcword|= CC_VBIT;
-    if (CC_C) srcword|= CC_CBIT;
+    dstword = 0;
     store_dst();
 }
 
-void lcdif()
+static void lcdif(void)
 {
-  AC= (ir >> 6) & 3;
-  if (INTMODE==0) {
-	load_src();
-	fregs[AC]= (float) srcword;
-  } else {
-	load_long();
-	fregs[AC]= (float) srclong;
-  }
+    AC = (0 >> 6) & 3;
+    if (INTMODE == 0) {
+        load_src();
+        fregs[AC] = (FLOAT)(s16)srcword;
+    } else {
+        load_long();
+        fregs[AC] = (FLOAT)srclong;
+    }
 }
 
-void stcfi()
+static void stcfi(void)
 {
-  AC= (ir >> 6) & 3;
-  if (INTMODE==0) {
-	dstword= (int16_t) fregs[AC];
-	store_dst();
-  } else {
-	dstlong= (int32_t) fregs[AC];
-	store_long();
-  }
+    AC = (0 >> 6) & 3;
+    if (INTMODE == 0) {
+        dstword = (s16)fregs[AC];
+        store_dst();
+    } else {
+        dstlong = (s32)fregs[AC];
+        store_long();
+    }
 }
 
-void stexp()
+static void stexp(void)
 {
- pdpfloat pdptmp;
-
- AC= (ir >> 6) & 3;
- to11float(&fregs[AC], &pdptmp);
- dstword= pdptmp.exp - 128;
- store_dst();
+    struct pdp_raw pdptmp;
+    AC = (0 >> 6) & 3;
+    to11float(&fregs[AC], &pdptmp);
+    dstword = ((pdptmp.hi >> 7) & 0xff) - 128;
+    store_dst();
 }
 
-void stcdf()
+static void stcdf(void)
 {
- FPMODE=1 - FPMODE; stf(); FPMODE=1 - FPMODE;
+    FPMODE = 1 - FPMODE;
+    stf();
+    FPMODE = 1 - FPMODE;
 }
 
-
-/* Load a double-precision floating-point value from memory into the FPU register */
-void ldcdf()
+static void ldcdf(void)
 {
- 		AC = (ir >> 6) & 3;   /* Get the accumulator field */
-    load_flt();            /* Load the source float from memory */
-    fregs[AC] = Srcflt;    /* Store it in the FPU register */
-    FPC = 0; FPV = 0;      /* Reset flags */
-    FPZ = (fregs[AC] == 0.0) ? 1 : 0;
-    FPN = (fregs[AC] < 0.0) ? 1 : 0;
-}
-
-
-/* Store FPU status (no-op / placeholder) */
-
-void stst()
-{
-		/* Optionally, store FPU condition codes or other status to memory */
-    /* For now, just clear the flags as a placeholder */
+    AC = (0 >> 6) & 3;
+    load_flt();
+    fregs[AC] = Srcflt;
     FPC = 0;
-    FPZ = 0;
-    FPN = 0;
     FPV = 0;
+    FPZ = (fregs[AC] == 0.0f) ? 1 : 0;
+    FPN = (fregs[AC] < 0.0f) ? 1 : 0;
 }
 
-void ldexpp(void)
+/* 32-bit load/store helpers */
+static inline void copylong_from_ispace(u16 addr, s32 *out)
 {
-    union {
-        float f;
-        uint32_t u;
-    } conv;
-
-    uint32_t sign, mantissa;
-    int exponent;
-    float new_val;
-
-    /* Select accumulator (AC0–AC3) */
-    AC = (ir >> 6) & 3;
-
-    /* Get current float register value */
-    conv.f = fregs[AC];
-
-    /* Break it down */
-    sign = (conv.u >> 31) & 0x1;
-    exponent = (int)((conv.u >> 23) & 0xFF);
-    mantissa = conv.u & 0x7FFFFF;
-
-    /* Load source (the new exponent modifier) */
-    load_src();
-
-    /* Modify exponent (bias = 127 for IEEE-754) */
-    exponent = (int)srcword + 127;
-    if (exponent > 255) exponent = 255;  /* clamp overflow */
-    if (exponent < 0) exponent = 0;      /* clamp underflow */
-
-    /* Rebuild float bits */
-    conv.u = (sign << 31) | ((uint32_t)(exponent & 0xFF) << 23) | mantissa;
-
-    /* Write back updated float */
-    fregs[AC] = conv.f;
-    new_val = conv.f;
-
-    /* Update FPU condition flags */
-    FPC = 0;
-    FPV = (fabsf(new_val) > XUL) ? 1 : 0;
-    FPZ = (new_val == 0.0f) ? 1 : 0;
-    FPN = (new_val < 0.0f) ? 1 : 0;
+    *out = (s32)((ispace[addr + 1] << 16) | ispace[addr]);
 }
 
+static inline void copylong_from_dspace(u16 addr, s32 *out)
+{
+    *out = (s32)((dspace[addr + 1] << 16) | dspace[addr]);
+}
+
+static inline void copylong_to_dspace(u16 addr, s32 val)
+{
+    dspace[addr] = (u16)(val & 0xffff);
+    dspace[addr + 1] = (u16)((val >> 16) & 0xffff);
+}

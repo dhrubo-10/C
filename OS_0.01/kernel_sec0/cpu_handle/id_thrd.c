@@ -331,20 +331,21 @@ void __init idt_install_sysvec(unsigned int n, const void *function)
 		set_intr_gate(n, function);
 }
 
-/* new additions */
-
 static inline unsigned long __apm_irq_save(void)
 {
 	unsigned long flags;
-	local_save_flags(flags);
+
+	local_irq_save(flags);
+
 	if (apm_info.allow_ints) {
-		if (irqs_disabled_flags(flags))
+
+		if (!irqs_disabled_flags(flags))
 			local_irq_enable();
-	} else
-		local_irq_disable();
+	} else local_irq_disable();
 
 	return flags;
 }
+
 
 #define apm_irq_save(flags) \
 	do { flags = __apm_irq_save(); } while (0)

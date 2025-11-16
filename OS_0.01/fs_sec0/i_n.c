@@ -7,6 +7,160 @@
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/exportfs.h>
+#include <linux/export.h>
+#include <linux/filelock.h>
+#include <linux/mm.h>
+#include <linux/backing-dev.h>
+#include <linux/hash.h>
+#include <linux/swap.h>
+#include <linux/security.h>
+#include <linux/cdev.h>
+#include <linux/memblock.h>
+#include <linux/fsnotify.h>
+#include <linux/mount.h>
+#include <linux/posix_acl.h>
+
+
+static unsigned int i_hash_mask __ro_after_init;
+static unsigned int i_hash_shift __ro_after_init;
+static struct hlist_head *inode_hashtable __ro_after_init;
+static __cacheline_aligned_in_smp DEFINE_SPINLOCK(inode_hash_lock);
+
+/*
+ * Empty aops. Can be used for the cases where the user does not
+ * define any of the address_space operations.
+ */
+const struct address_space_operations empty_aops = {
+};
+EXPORT_SYMBOL(empty_aops);
+
+static DEFINE_PER_CPU(unsigned long, nr_inodes);
+static DEFINE_PER_CPU(unsigned long, nr_unused);
+
+static struct kmem_cache *inode_cachep __ro_after_init;
+
+static long get_nr_inodes(void)
+{
+	int i;
+	long sum = 0;
+	for_each_possible_cpu(i)
+		sum += per_cpu(nr_inodes, i);
+	return sum < 0 ? 0 : sum;
+}
+
+static inline long get_nr_inodes_unused(void)
+{
+	int i;
+	long sum = 0;
+	for_each_possible_cpu(i)
+		sum += per_cpu(nr_unused, i);
+	return sum < 0 ? 0 : sum;
+}
+
+long get_nr_dirty_inodes(void)
+{
+	/* not actually dirty inodes, but a wild approximation */
+	long nr_dirty = get_nr_inodes() - get_nr_inodes_unused();
+	return nr_dirty > 0 ? nr_dirty : 0;
+}
+
+#ifdef CONFIG_DEBUG_FS
+static DEFINE_PER_CPU(long, mg_ctime_updates);
+static DEFINE_PER_CPU(long, mg_fine_stamps);
+static DEFINE_PER_CPU(long, mg_ctime_swaps);
+
+static unsigned long get_mg_ctime_updates(void)
+{
+	unsigned long sum = 0;
+	int i;
+
+	for_each_possible_cpu(i)
+		sum += data_race(per_cpu(mg_ctime_updates, i));
+	return sum;
+}
+
+static unsigned long get_mg_fine_stamps(void)
+{
+	unsigned long sum = 0;
+	int i;
+
+	for_each_possible_cpu(i)
+		sum += data_race(per_cpu(mg_fine_stamps, i));
+	return sum;
+}
+
+static unsigned long get_mg_ctime_swaps(void)
+{
+	unsigned long sum = 0;
+	int i;
+
+	for_each_possible_cpu(i)
+		sum += data_race(per_cpu(mg_ctime_swaps, i));
+	return sum;
+}
+
+#define mgtime_counter_inc(__var)	this_cpu_inc(__var)
+
+static int mgts_show(struct seq_file *s, void *p)
+{
+	unsigned long ctime_updates = get_mg_ctime_updates();
+	unsigned long ctime_swaps = get_mg_ctime_swaps();
+	unsigned long fine_stamps = get_mg_fine_stamps();
+	unsigned long floor_swaps = timekeeping_get_mg_floor_swaps();
+
+	seq_printf(s, "%lu %lu %lu %lu\n",
+		   ctime_updates, ctime_swaps, fine_stamps, floor_swaps);
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(mgts);
+
+static int __init mg_debugfs_init(void)
+{
+	debugfs_create_file("multigrain_timestamps", S_IFREG | S_IRUGO, NULL, NULL, &mgts_fops);
+	return 0;
+}
+late_initcall(mg_debugfs_init);
+
+#else 
+
+#define mgtime_counter_inc(__var)	do { } while (0)
+
+#endif 
+
+/*
+ * Handle nr_inode sysctl
+ */
+#ifdef CONFIG_SYSCTL
+/*
+ * Statistics gathering..
+ */
+static struct inodes_stat_t inodes_stat;
+
+static int proc_nr_inodes(const struct ctl_table *table, int write, void *buffer,
+			  size_t *lenp, loff_t *ppos)
+{
+	inodes_stat.nr_inodes = get_nr_inodes();
+	inodes_stat.nr_unused = get_nr_inodes_unused();
+	return proc_doulongvec_minmax(table, write, buffer, lenp, ppos);
+}
+
+static const struct ctl_table inodes_sysctls[] = {
+	{
+		.procname	= "inode-nr",
+		.data		= &inodes_stat,
+		.maxlen		= 2*sizeof(long),
+		.mode		= 0444,
+		.proc_handler	= proc_nr_inodes,
+	},
+	{
+		.procname	= "inode-state",
+		.data		= &inodes_stat,
+		.maxlen		= 7*sizeof(long),
+		.mode		= 0444,
+		.proc_handler	= proc_nr_inodes,
+	},
+};
 
 static struct inode *simplefs_iget_internal(struct super_block *sb, unsigned long ino)
 {

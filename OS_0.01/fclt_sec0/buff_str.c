@@ -216,11 +216,12 @@ struct buffer_head * bread(int dev,int block)
 
 void buffer_init(void)
 {
-	struct buffer_head * h = start_buffer;
-	void * b = (void *) BUFFER_END;
+	struct buffer_head *h = start_buffer;
+	void *end = (void *)BUFFER_END;
+	void *ptr = end;
 	int i;
 
-	while ( (b -= BLOCK_SIZE) >= ((void *) (h+1)) ) {
+	while ((ptr -= BLOCK_SIZE) >= (void *)(h + 1)) {
 		h->b_dev = 0;
 		h->b_dirt = 0;
 		h->b_count = 0;
@@ -229,18 +230,22 @@ void buffer_init(void)
 		h->b_wait = NULL;
 		h->b_next = NULL;
 		h->b_prev = NULL;
-		h->b_data = (char *) b;
-		h->b_prev_free = h-1;
-		h->b_next_free = h+1;
+		h->b_data = (char *)ptr;
+		h->b_prev_free = h - 1;
+		h->b_next_free = h + 1;
+
 		h++;
 		NR_BUFFERS++;
-		if (b == (void *) 0x100000)
-			b = (void *) 0xA0000;
+
+		if (ptr == (void *)0x100000)
+			ptr = (void *)0xA0000;
 	}
+
 	h--;
 	free_list = start_buffer;
 	free_list->b_prev_free = h;
 	h->b_next_free = free_list;
-	for (i=0;i<NR_HASH;i++)
-		hash_table[i]=NULL;
-}	
+
+	for (i = 0; i < NR_HASH; i++)
+		hash_table[i] = NULL;
+}

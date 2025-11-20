@@ -1,38 +1,78 @@
-# include "i3_hc.c"
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
-IEH3bsz 512;
-IEH3mbuf (fn, type)
+#include "i3_hc.h"
 
-int fn, type;
-{
-struct fileps *fp;
-extern char *IEH3olbf[], *alloc();
-extern int IEHfbak[10];
-int bx[19], size, bloc;
-fp = &IEH3fpts[fn];
-fp->eoferr = fp->nchars = 0;
-fp->wrflag = type+1;
-/* decide whether to buffer or not */
-if (ttyn(fn) != 'x')
-	size = 1;
-else
-if (fstat(fn,bx) > 0 && bx[0] == 40 && type == 0)
-	size = 1;
-else
-	size = IEH3bsz;
-for (fp->buff = 0; size >10 && fp->buff == 0; size =/ 4)
-		if ((bloc = alloc(size+100)) != -1)
-			{
-			IEH3olbf[fn] = bloc;
-			fp->buff = fp->bptr =bloc + 100;
-			fp->bsize = size;
-			break;
-			}
-if (fp->buff == 0)
-	{
-	fp->buff = fp->bptr = &IEHfbak[fn];
-	fp->bsize = size>1 ? 2 : 1;
-	}
-}
-struct fileps IEH3fpts [10];
+#define IEH3BSZ 512
+
+struct fileps IEH3fpts[10];
 int IEHfbak[10];
+char *IEH3olbf[10];
+
+/*
+ * Return 'x' if file descriptor is a terminal.
+ * Original code used ttyn(fn) == 'x';
+ * Here we keep compatibility by providing safe equivalent.
+ */
+static int is_terminal(int fd)
+{
+    return isatty(fd);
+}
+
+/*
+ * Modern, fixed version of IEH3mbuf().
+ */
+void IEH3mbuf(int fn, int type)
+{
+    struct fileps *fp;
+    struct stat st;
+
+    if (fn < 0 || fn >= 10)
+        return;
+
+    fp = &IEH3fpts[fn];
+
+    fp->eoferr = 0;
+    fp->nchars = 0;
+    fp->wrflag = type + 1;
+
+    int size;
+
+    /* Choose buffer size based on TTY + file type */
+    if (!is_terminal(fn)) {
+        size = 1;
+    } else if (fstat(fn, &st) == 0 && S_ISREG(st.st_mode) && type == 0) {
+        size = 1;
+    } else {
+        size = IEH3BSZ;
+    }
+
+    fp->buff = NULL;
+
+    /*
+     * Try allocating a buffered block
+     * Original: alloc(size+100) and retry with size/=4
+     */
+    while (size > 10 && fp->buff == NULL) {
+
+        char *mem = malloc(size + 100);
+        if (mem) {
+            IEH3olbf[fn] = mem;
+            fp->buff = mem + 100;
+            fp->bptr = fp->buff;
+            fp->bsize = size;
+            break;
+        }
+
+        size /= 4;
+    }
+
+    
+    if (!fp->buff) {
+        fp->buff = (char *)&IEHfbak[fn];
+        fp->bptr = fp->buff;
+        fp->bsize = (size > 1) ? 2 : 1;
+    }
+}

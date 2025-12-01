@@ -102,45 +102,53 @@ static void msg_rcu_free(struct rcu_head *head)
 static int newque(struct ipc_namespace *ns, struct ipc_params *params)
 {
 	struct msg_queue *msq;
-	int retval;
+	int id, retval;
 	key_t key = params->key;
 	int msgflg = params->flg;
 
+	/* Allocate the queue structure */
 	msq = kmalloc(sizeof(*msq), GFP_KERNEL_ACCOUNT);
 	if (unlikely(!msq))
 		return -ENOMEM;
 
+	/* Initialize permissions */
 	msq->q_perm.mode = msgflg & S_IRWXUGO;
-	msq->q_perm.key = key;
-
+	msq->q_perm.key  = key;
 	msq->q_perm.security = NULL;
+
 	retval = security_msg_queue_alloc(&msq->q_perm);
 	if (retval) {
 		kfree(msq);
 		return retval;
 	}
 
-	msq->q_stime = msq->q_rtime = 0;
-	msq->q_ctime = ktime_get_real_seconds();
-	msq->q_cbytes = msq->q_qnum = 0;
+	/* Initialize queue state */
+	msq->q_stime  = 0;
+	msq->q_rtime  = 0;
+	msq->q_ctime  = ktime_get_real_seconds();
+	msq->q_cbytes = 0;
+	msq->q_qnum   = 0;
 	msq->q_qbytes = ns->msg_ctlmnb;
-	msq->q_lspid = msq->q_lrpid = NULL;
+
+	/* Correct: these are pid_t, not pointers */
+	msq->q_lspid = 0;
+	msq->q_lrpid = 0;
+
 	INIT_LIST_HEAD(&msq->q_messages);
 	INIT_LIST_HEAD(&msq->q_receivers);
 	INIT_LIST_HEAD(&msq->q_senders);
 
-	/* ipc_addid() locks msq upon success. */
-	retval = ipc_addid(&msg_ids(ns), &msq->q_perm, ns->msg_ctlmni);
-	if (retval < 0) {
+	/* Add this queue to the IPC ID table
+	 * ipc_addid() takes the lock on success.
+	 */
+	id = ipc_addid(&msg_ids(ns), &msq->q_perm, ns->msg_ctlmni);
+	if (id < 0) {
 		ipc_rcu_putref(&msq->q_perm, msg_rcu_free);
-		return retval;
+		return id;
 	}
 
-	ipc_unlock_object(&msq->q_perm);
-	rcu_read_unlock();
+	/* Unlock after successful ipc_addid()_*
 
-	return msq->q_perm.id;
-}
 
 static inline bool msg_fits_inqueue(struct msg_queue *msq, size_t msgsz)
 {

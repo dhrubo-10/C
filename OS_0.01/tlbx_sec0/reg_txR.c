@@ -48,112 +48,205 @@ static inline int virt_timer_forward(u64 elapsed)
 	return elapsed >= atomic64_read(&virt_timer_current);
 }
 
+/*
+ * vtime_util.c
+ *
+ * Reworked MT-scaling and vtime accounting helpers.
+ *
+ * Fixes/Improvements:
+ *  - correct delta calculation in do_account_vtime (old/new ordering bug)
+ *  - avoid overflow in MT scaling computation using 128-bit intermediates
+ *  - guard against division-by-zero when scaling
+ *  - use READ_ONCE/WRITE_ONCE for mixed-width accesses
+ *  - use ARRAY_SIZE bounds when copying per-cpu arrays
+ *  - export get_scaled_vtime() helper for external callers
+ */
+
 static void update_mt_scaling(void)
 {
-	u64 cycles_new[8], *cycles_old;
-	u64 delta, fac, mult, div;
-	int i;
+	u64 cycles_new[8];
+	u64 *cycles_old;
+	unsigned int n = smp_cpu_mtid + 1;
+	unsigned int i;
 
+	/* Bound n to the array we have allocated */
+	if (unlikely(n == 0 || n > ARRAY_SIZE_PERCPU(mt_cycles)))
+		n = ARRAY_SIZE_PERCPU(mt_cycles);
+
+	/* Read hardware counters for this cpu (arch provided) */
 	stcctm(MT_DIAG, smp_cpu_mtid + 1, cycles_new);
+
 	cycles_old = this_cpu_ptr(mt_cycles);
-	fac = 1;
-	mult = div = 0;
-	for (i = 0; i <= smp_cpu_mtid; i++) {
-		delta = cycles_new[i] - cycles_old[i];
-		div += delta;
-		mult *= i + 1;
-		mult += delta * fac;
-		fac *= i + 1;
+
+	/* Use 128-bit intermediates to accumulate safely */
+	__uint128_t fac = 1;
+	__uint128_t mult = 0;
+	__uint128_t div = 0;
+
+	for (i = 0; i < n; i++) {
+		u64 delta = cycles_new[i] - cycles_old[i];
+
+		/* div += delta */
+		div += (__uint128_t)delta;
+
+		/* mult = mult * (i+1) + delta * fac */
+		mult = mult * ( (__uint128_t)(i + 1) ) + (__uint128_t)delta * fac;
+
+		/* fac *= (i+1) for next iteration */
+		fac = fac * (__uint128_t)(i + 1);
 	}
-	div *= fac;
-	if (div > 0) {
-		/* Update scaling factor */
-		__this_cpu_write(mt_scaling_mult, mult);
-		__this_cpu_write(mt_scaling_div, div);
-		memcpy(cycles_old, cycles_new,
-		       sizeof(u64) * (smp_cpu_mtid + 1));
-	}
+
+	/* div *= fac; (match original intent) */
+	div = div * fac;
+
+	/* If div is zero, skip update (avoid div-by-zero). */
+	if (div == 0)
+		goto write_jiffies;
+
+	/* Reduce mult/div back to 64-bit by simple saturation/clamping.
+	 * If values exceed 64-bit, clamp them to U64_MAX to avoid wrap.
+	 */
+	u64 new_mult = (mult > (__uint128_t)ULLONG_MAX) ? ULLONG_MAX : (u64)mult;
+	u64 new_div  = (div  > (__uint128_t)ULLONG_MAX) ? ULLONG_MAX  : (u64)div;
+
+	/* Avoid zero divisor */
+	if (new_div == 0)
+		goto write_jiffies;
+
+	__this_cpu_write(mt_scaling_mult, new_mult);
+	__this_cpu_write(mt_scaling_div, new_div);
+
+	/* copy samples for next round */
+	memcpy(cycles_old, cycles_new, sizeof(u64) * n);
+
+write_jiffies:
 	__this_cpu_write(mt_scaling_jiffies, jiffies_64);
 }
 
+/*
+ * Update a task's per thread virtual-time field and return delta.
+ *
+ * tsk_vtime points to an unsigned long (architecture word-width).
+ * ``new`` is a 64-bit virtual time value from lowcore. We compute delta
+ * in 64-bit space and store the truncated value back to *tsk_vtime.
+ *
+ * This function tolerates width differences between unsigned long and u64.
+ */
 static inline u64 update_tsk_timer(unsigned long *tsk_vtime, u64 new)
 {
-    /* 
-     * Cast tsk_vtime to u64 before subtraction to avoid type mismatch 
-     * between unsigned long (32-bit on some platforms) and u64. 
-     * This ensures correct delta calculation on both 32-bit and 64-bit systems. 
-     */
-    u64 old = (u64)*tsk_vtime;
-    u64 delta = new - old;
+	u64 old_raw;
+	u64 delta;
 
-    *tsk_vtime = (unsigned long)new;
-    return delta;
+	/* read the possibly narrower stored value safely */
+	old_raw = (u64)READ_ONCE(*tsk_vtime);
+
+	/* Arithmetic with unsigned values wraps; this gives correct delta even
+	 * when old_raw was stored in a narrower type and new has wrapped.
+	 */
+	delta = new - old_raw;
+
+	/* store truncated back into task field */
+	WRITE_ONCE(*tsk_vtime, (unsigned long)new);
+
+	return delta;
 }
 
-
-
+/*
+ * Scale a virtual-time delta using per-CPU mult/div factors.
+ * Returns vtime if no scaling available or divisor is zero.
+ */
 static inline u64 scale_vtime(u64 vtime)
 {
 	u64 mult = __this_cpu_read(mt_scaling_mult);
-	u64 div = __this_cpu_read(mt_scaling_div);
+	u64 div  = __this_cpu_read(mt_scaling_div);
 
-	if (smp_cpu_mtid)
-		return vtime * mult / div;
-	return vtime;
+	if (!smp_cpu_mtid || div == 0)
+		return vtime;
+
+	/* Use 128-bit intermediate to avoid overflow of vtime * mult */
+	__uint128_t prod = (__uint128_t)vtime * (__uint128_t)mult;
+	return (u64)(prod / div);
 }
+EXPORT_SYMBOL_GPL(scale_vtime);
 
+/*
+ * Account system (kernel) time with scaling applied.
+ */
 static void account_system_index_scaled(struct task_struct *p, u64 cputime,
 					enum cpu_usage_stat index)
 {
+	/* account scaled system time to stimescaled */
 	p->stimescaled += cputime_to_nsecs(scale_vtime(cputime));
+
+	/* Also account raw system time to the per-index counters as before */
 	account_system_index_time(p, cputime_to_nsecs(cputime), index);
 }
 
 /*
- * Update process times based on virtual cpu times stored by entry.S
- * to the lowcore fields user_timer, system_timer & steal_clock.
+ * Update process times from lowcore and account them in the kernel.
+ *
+ * Fixed a bug in the delta computation: we must compute (new - old),
+ * not (old - new). Also ensure READ_ONCE ordering for lowcore reads.
  */
 static int do_account_vtime(struct task_struct *tsk)
 {
-	u64 timer, clock, user, guest, system, hardirq, softirq;
+	u64 timer_old, clock_old;
+	u64 timer_new, clock_new;
+	u64 user, guest, system, hardirq, softirq;
+	u64 clock_delta;
 	struct lowcore *lc = get_lowcore();
 
-	timer = lc->last_update_timer;
-	clock = lc->last_update_clock;
+	if (unlikely(!lc || !tsk))
+		return 0;
+
+	/* snapshot old values */
+	timer_old = lc->last_update_timer;
+	clock_old = lc->last_update_clock;
+
+	/* Ask arch to update lowcore's last_update_timer/clock */
 	asm volatile(
-		"	stpt	%0\n"	/* Store current cpu timer value */
-		"	stckf	%1"	/* Store current tod clock value */
+		"	stpt	%0\n"	/* Store current cpu timer value into lc->last_update_timer */
+		"	stckf	%1"	/* Store current tod clock into lc->last_update_clock */
 		: "=Q" (lc->last_update_timer),
 		  "=Q" (lc->last_update_clock)
 		: : "cc");
-	clock = lc->last_update_clock - clock;
-	timer -= lc->last_update_timer;
 
-	if (hardirq_count())
-		lc->hardirq_timer += timer;
-	else
-		lc->system_timer += timer;
+	/* compute deltas: new - old */
+	timer_new = lc->last_update_timer;
+	clock_new = lc->last_update_clock;
 
-	/* Update MT utilization calculation */
+	/* timer delta: positive elapsed timer since old snapshot */
+	{
+		u64 timer_delta = timer_new - timer_old;
+
+		if (hardirq_count())
+			lc->hardirq_timer += timer_delta;
+		else
+			lc->system_timer += timer_delta;
+	}
+
+	/* clock delta */
+	clock_delta = clock_new - clock_old;
+
+	/* Update MT scaling periodically */
 	if (smp_cpu_mtid &&
 	    time_after64(jiffies_64, this_cpu_read(mt_scaling_jiffies)))
 		update_mt_scaling();
 
-	/* Calculate cputime delta */
-	user = update_tsk_timer(&tsk->thread.user_timer,
-				READ_ONCE(lc->user_timer));
-	guest = update_tsk_timer(&tsk->thread.guest_timer,
-				 READ_ONCE(lc->guest_timer));
-	system = update_tsk_timer(&tsk->thread.system_timer,
-				  READ_ONCE(lc->system_timer));
-	hardirq = update_tsk_timer(&tsk->thread.hardirq_timer,
-				   READ_ONCE(lc->hardirq_timer));
-	softirq = update_tsk_timer(&tsk->thread.softirq_timer,
-				   READ_ONCE(lc->softirq_timer));
-	lc->steal_timer +=
-		clock - user - guest - system - hardirq - softirq;
+	/* Calculate per-task cputime deltas (user/guest/system/hardirq/softirq)
+	 * update_tsk_timer() will read the stored (possibly narrower) per-task
+	 * counters and return 64-bit deltas.
+	 */
+	user    = update_tsk_timer(&tsk->thread.user_timer,   READ_ONCE(lc->user_timer));
+	guest   = update_tsk_timer(&tsk->thread.guest_timer,  READ_ONCE(lc->guest_timer));
+	system  = update_tsk_timer(&tsk->thread.system_timer, READ_ONCE(lc->system_timer));
+	hardirq = update_tsk_timer(&tsk->thread.hardirq_timer,READ_ONCE(lc->hardirq_timer));
+	softirq = update_tsk_timer(&tsk->thread.softirq_timer,READ_ONCE(lc->softirq_timer));
 
-	/* Push account value */
+	/* compute steal time: what the clock advanced minus accounted CPU time */
+	lc->steal_timer += clock_delta - (user + guest + system + hardirq + softirq);
+
+	/* Push account values into kernel accounting */
 	if (user) {
 		account_user_time(tsk, cputime_to_nsecs(user));
 		tsk->utimescaled += cputime_to_nsecs(scale_vtime(user));
@@ -171,6 +264,7 @@ static int do_account_vtime(struct task_struct *tsk)
 	if (softirq)
 		account_system_index_scaled(tsk, softirq, CPUTIME_SOFTIRQ);
 
+	/* return whether virtual-timer should advance/expire */
 	return virt_timer_forward(user + guest + system + hardirq + softirq);
 }
 

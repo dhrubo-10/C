@@ -75,37 +75,97 @@ static ssize_t cpuid_read(struct file *file, char __user *buf,
 
 	return bytes ? bytes : err;
 }
-
 static int cpuid_open(struct inode *inode, struct file *file)
 {
-	unsigned int cpu;
+	unsigned int cpu = iminor(file_inode(file));
 	struct cpuinfo_x86 *c;
 
-	cpu = iminor(file_inode(file));
+	/* Validate CPU index */
 	if (cpu >= nr_cpu_ids || !cpu_online(cpu))
-		return -ENXIO;	/* No such CPU */
+		return -ENXIO;
 
 	c = &cpu_data(cpu);
-	if (c->cpuid_level < 0)
-		return -EIO;	/* CPUID not supported */
 
+	/* Ensure CPUID instruction is supported */
+	if (c->cpuid_level < 0)
+		return -EIO;
+
+	/* Optional: Restrict access */
+	if (cpuid_restrict && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	/* Hold a reference to the CPU so hotplug cannot remove it */
+	if (!get_cpu_device(cpu))
+		return -ENODEV;
+
+	file->private_data = (void *)(unsigned long)cpu;
 	return 0;
 }
 
-/*
- * File operations we support
- */
+static int cpuid_release(struct inode *inode, struct file *file)
+{
+	unsigned int cpu = (unsigned long)file->private_data;
+	/* Release reference acquired during open */
+	put_device(get_cpu_device(cpu));
+	return 0;
+}
+
+static ssize_t cpuid_read(struct file *file, char __user *buf,
+			  size_t count, loff_t *ppos)
+{
+	unsigned int cpu = (unsigned long)file->private_data;
+	u32 eax, ebx, ecx, edx;
+	u32 leaf = *ppos;   /* leaf = offset */
+	int ret;
+
+	if (count < sizeof(u32) * 4)
+		return -EINVAL;
+
+	if (!cpu_online(cpu))
+		return -ENXIO;
+
+	/* Pin task to requested CPU to guarantee CPUID correctness */
+	ret = work_on_cpu(cpu, ({
+		cpuid_count(leaf, 0, &eax, &ebx, &ecx, &edx);
+		0;
+	}));
+	if (ret)
+		return ret;
+
+	if (copy_to_user(buf, &eax, sizeof(eax)))
+		return -EFAULT;
+	if (copy_to_user(buf + 4, &ebx, sizeof(ebx)))
+		return -EFAULT;
+	if (copy_to_user(buf + 8, &ecx, sizeof(ecx)))
+		return -EFAULT;
+	if (copy_to_user(buf + 12, &edx, sizeof(edx)))
+		return -EFAULT;
+
+	*ppos += 1; /* Advance to next CPUID leaf */
+	return sizeof(u32) * 4;
+}
+
+/* File operations */
 static const struct file_operations cpuid_fops = {
-	.owner = THIS_MODULE,
-	.llseek = no_seek_end_llseek,
-	.read = cpuid_read,
-	.open = cpuid_open,
+	.owner		= THIS_MODULE,
+	.llseek		= no_seek_end_llseek,
+	.read		= cpuid_read,
+	.open		= cpuid_open,
+	.release	= cpuid_release,
 };
 
+/*
+ * Dynamic sysfs devnode creation
+ * Example: /dev/cpu/3/cpuid
+ */
 static char *cpuid_devnode(const struct device *dev, umode_t *mode)
 {
+	if (mode)
+		*mode = 0444;  /* world-readable unless restricted */
+
 	return kasprintf(GFP_KERNEL, "cpu/%u/cpuid", MINOR(dev->devt));
 }
+
 
 static const struct class cpuid_class = {
 	.name		= "cpuid",

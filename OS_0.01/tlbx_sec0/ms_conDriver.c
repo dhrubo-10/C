@@ -129,9 +129,8 @@ enclosure_register(struct device *dev, const char *name, int components,
 EXPORT_SYMBOL_GPL(enclosure_register);
 
 /* Null-callback placeholder to avoid calling into freed callbacks */
-static struct enclosure_component_callbacks enclosure_null_callbacks;
+static struct enclosure_component_callbacks enclosure_null_callbacks = {};
 
-/* Unregister an enclosure device and its components */
 void enclosure_unregister(struct enclosure_device *edev)
 {
 	int i;
@@ -139,23 +138,43 @@ void enclosure_unregister(struct enclosure_device *edev)
 	if (!edev)
 		return;
 
-	/* remove from global list */
+	/* prevent any future callbacks immediately */
+	edev->cb = &enclosure_null_callbacks;
+
+	/* detach from global list */
 	mutex_lock(&container_list_lock);
 	list_del_init(&edev->node);
 	mutex_unlock(&container_list_lock);
 
-	/* unregister any registered component devices */
-	for (i = 0; i < edev->components; i++)
-		if (edev->component[i].number != -1)
-			device_unregister(&edev->component[i].cdev);
+	/* unregister all associated components */
+	for (i = 0; i < edev->components; i++) {
+		struct enclosure_component *c = &edev->component[i];
 
-	/* prevent any further callbacks into user code */
-	edev->cb = &enclosure_null_callbacks;
+		if (!c)
+			continue;
+
+		/* skip unused / uninitialized slots */
+		if (c->number < 0)
+			continue;
+
+		/* remove sysfs links before unregistration (new safety step) */
+		enclosure_remove_links(c);
+
+		/* unregister the actual component device */
+		device_unregister(&c->cdev);
+
+		/* drop its kobject reference */
+		put_device(&c->cdev);
+	}
 
 	/* unregister the enclosure device itself */
 	device_unregister(&edev->edev);
+
+	/* drop enclosure device reference */
+	put_device(&edev->edev);
 }
 EXPORT_SYMBOL_GPL(enclosure_unregister);
+
 
 /* helper to create a stable link name: "enclosure_device:<devname>" */
 #define ENCLOSURE_NAME_SIZE	64
@@ -163,43 +182,69 @@ EXPORT_SYMBOL_GPL(enclosure_unregister);
 
 static void enclosure_link_name(struct enclosure_component *cdev, char *name)
 {
-	snprintf(name, ENCLOSURE_NAME_SIZE, "enclosure_device:%s",
-		 dev_name(&cdev->cdev));
+	const char *dname = dev_name(&cdev->cdev);
+
+	snprintf(name, ENCLOSURE_NAME_SIZE,
+		 "enclosure_device:%s", dname ? dname : "unknown");
 }
 
-/* remove bidirectional sysfs links for a component */
+/*
+ * Remove all bidirectional sysfs links for a component.
+ * Now includes:
+ * - stronger NULL checks,
+ * - ensures links are removed only when present,
+ * - cleans up both ways symmetrically.
+ */
 static void enclosure_remove_links(struct enclosure_component *cdev)
 {
 	char name[ENCLOSURE_NAME_SIZE];
 
+	if (!cdev)
+		return;
+
 	enclosure_link_name(cdev, name);
 
+	/* remove device -> component link */
 	if (cdev->dev && cdev->dev->kobj.sd)
 		sysfs_remove_link(&cdev->dev->kobj, name);
 
+	/* remove component -> device link */
 	if (cdev->cdev.kobj.sd)
 		sysfs_remove_link(&cdev->cdev.kobj, "device");
 }
 
-/* add bidirectional sysfs links for a component */
+/*
+ *
+ * Improvements:
+ * - complete rollback on partial failure
+ * - consistent naming
+ * - stronger null guards
+ */
 static int enclosure_add_links(struct enclosure_component *cdev)
 {
-	int error;
+	int err;
 	char name[ENCLOSURE_NAME_SIZE];
 
-	/* create link in component -> device */
-	error = sysfs_create_link(&cdev->cdev.kobj, &cdev->dev->kobj, "device");
-	if (error)
-		return error;
+	if (!cdev || !cdev->dev)
+		return -EINVAL;
 
-	/* create link device -> component with stable name */
+	/* component -> device */
+	err = sysfs_create_link(&cdev->cdev.kobj, &cdev->dev->kobj, "device");
+	if (err)
+		return err;
+
+	/* device -> component */
 	enclosure_link_name(cdev, name);
-	error = sysfs_create_link(&cdev->dev->kobj, &cdev->cdev.kobj, name);
-	if (error)
+	err = sysfs_create_link(&cdev->dev->kobj, &cdev->cdev.kobj, name);
+	if (err) {
+		/* rollback */
 		sysfs_remove_link(&cdev->cdev.kobj, "device");
+		return err;
+	}
 
-	return error;
+	return 0;
 }
+
 
 /* release callback for enclosure device */
 static void enclosure_release(struct device *cdev)

@@ -233,56 +233,115 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 
 int sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
-	__sched_fork(clone_flags, p);
-	p->__state = TASK_NEW;
-	p->prio = current->normal_prio;
-	uclamp_fork(p);
+    /* basic validation */
+    if (!p)
+        return -EINVAL;
 
-	if (unlikely(p->sched_reset_on_fork)) {
-		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
-			p->policy = SCHED_NORMAL;
-			p->static_prio = NICE_TO_PRIO(0);
-			p->rt_priority = 0;
-		} else if (PRIO_TO_NICE(p->static_prio) < 0)
-			p->static_prio = NICE_TO_PRIO(0);
+    /* core scheduler fork bookkeeping (arch / core setup) */
+    __sched_fork(clone_flags, p);
 
-		p->prio = p->normal_prio = p->static_prio;
-		set_load_weight(p, false);
-		p->se.custom_slice = 0;
-		p->se.slice = sysctl_sched_base_slice;
-		p->sched_reset_on_fork = 0;
-	}
+    /* New task state */
+    p->__state = TASK_NEW;
 
-	if (dl_prio(p->prio))
-		return -EAGAIN;
+    /* ensure normal_prio is seeded from current and prio matches it by default */
+    p->normal_prio = current->normal_prio;
+    p->prio = p->normal_prio;
 
-	scx_pre_fork(p);
+    /*
+     * copy uclamp state for the forked task early so later logic (priority
+     * reset on fork, load weight setup) can observe correct clamp values.
+     */
+    uclamp_fork(p);
 
-	if (rt_prio(p->prio)) {
-		p->sched_class = &rt_sched_class;
+    /*
+     * If user requested a scheduling attribute reset on fork, reset policy
+     * and priorities to sane defaults. Keep this behavior consistent with
+     * upstream: convert RT/DL tasks to SCHED_NORMAL and normalize nice
+     * if requested.
+     */
+    if (unlikely(p->sched_reset_on_fork)) {
+        if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
+            p->policy = SCHED_NORMAL;
+            p->static_prio = NICE_TO_PRIO(0);
+            p->rt_priority = 0;
+        } else if (PRIO_TO_NICE(p->static_prio) < 0) {
+            p->static_prio = NICE_TO_PRIO(0);
+        }
+
+        p->prio = p->normal_prio = p->static_prio;
+
+        /*
+         * Recompute load weight and scheduling slices for the reset state.
+         * set_load_weight() expects a boolean "update" argument (false here
+         * to indicate initial setup).
+         */
+        set_load_weight(p, false);
+
+        p->se.custom_slice = 0;
+        p->se.slice = sysctl_sched_base_slice;
+
+        /* Clear the flag so we don't reset repeatedly. */
+        p->sched_reset_on_fork = 0;
+    }
+
+    /* Reject if the new task has a deadline priority that can't be honored */
+    if (dl_prio(p->prio))
+        return -EAGAIN;
+
+    /* Hook for scheduler extension pre-fork bookkeeping (if present) */
+    scx_pre_fork(p);
+
+    /*
+     * Select scheduling class. Maintain compatibility with CONFIG_SCHED_CLASS_EXT
+     * if present; prefer RT if RT priority set, then extension, then fair.
+     */
+    if (rt_prio(p->prio)) {
+        p->sched_class = &rt_sched_class;
 #ifdef CONFIG_SCHED_CLASS_EXT
-	} else if (task_should_scx(p->policy)) {
-		p->sched_class = &ext_sched_class;
+    } else if (task_should_scx(p->policy)) {
+        p->sched_class = &ext_sched_class;
 #endif
-	} else {
-		p->sched_class = &fair_sched_class;
-	}
+    } else {
+        p->sched_class = &fair_sched_class;
+    }
 
-	init_entity_runnable_average(&p->se);
+    /*
+     * Initialize the runnability accounting for entity. This resets the
+     * runnable average used by CFS-like variants.
+     */
+    init_entity_runnable_average(&p->se);
+
+    /*
+     * Initialize execution accounting fields that must not be inherited from parent.
+     * This avoids bogus accounting values for newly forked tasks.
+     */
+    p->se.exec_start = 0;
+    p->se.sum_exec_runtime = 0;
+    p->se.wait_start = 0;
+    p->se.avg.load_avg = 0;
 
 #ifdef CONFIG_SCHED_INFO
-	if (likely(sched_info_on()))
-		memset(&p->sched_info, 0, sizeof(p->sched_info));
+    if (likely(sched_info_on()))
+        memset(&p->sched_info, 0, sizeof(p->sched_info));
 #endif
 
-	p->on_cpu = 0;
-	init_task_preempt_count(p);
-	plist_node_init(&p->pushable_tasks, MAX_PRIO);
-	RB_CLEAR_NODE(&p->pushable_dl_tasks);
+    /* Ensure the new task appears off-CPU initially */
+    p->on_cpu = 0;
 
-	return 0;
+    /* initialize preempt count for the new task */
+    init_task_preempt_count(p);
+
+    /* prepare pushable task list and deadline red-black node */
+    plist_node_init(&p->pushable_tasks, MAX_PRIO);
+    RB_CLEAR_NODE(&p->pushable_dl_tasks);
+
+    /* clear CPU-affine runtime bookkeeping that must not be shared */
+    p->se.nr_migrations = 0;
+
+    return 0;
 }
 EXPORT_SYMBOL(sched_fork);
+
 
 int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
 {

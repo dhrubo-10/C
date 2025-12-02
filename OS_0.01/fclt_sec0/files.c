@@ -1,3 +1,4 @@
+/* Updated!! */
 #include <errno.h>
 #include <fcntl.h>
 
@@ -5,76 +6,92 @@
 #include <linux/kernel.h>
 #include <asm/segment.h>
 
-#define MIN(a,b) (((a)<(b))?(a):(b))
-#define MAX(a,b) (((a)>(b))?(a):(b))
+#define MIN(a,b) ((a)<(b)?(a):(b))
 
-int file_read(struct m_inode * inode, struct file * filp, char * buf, int count)
+int file_read(struct m_inode *inode, struct file *filp, char *buf, int count)
 {
-	int left,chars,nr;
-	struct buffer_head * bh;
+	int left = count;
+	int block, off, n;
+	struct buffer_head *bh;
 
-	if ((left=count)<=0)
+	if (count <= 0)
 		return 0;
-	while (left) {
-		if (nr = bmap(inode,(filp->f_pos)/BLOCK_SIZE)) {
-			if (!(bh=bread(inode->i_dev,nr)))
+
+	while (left > 0) {
+		block = bmap(inode, filp->f_pos / BLOCK_SIZE);
+		if (block > 0) {
+			bh = bread(inode->i_dev, block);
+			if (!bh)
 				break;
-		} else
+		} else {
 			bh = NULL;
-		nr = filp->f_pos % BLOCK_SIZE;
-		chars = MIN( BLOCK_SIZE-nr , left );
-		filp->f_pos += chars;
-		left -= chars;
+		}
+
+		off = filp->f_pos % BLOCK_SIZE;
+		n = MIN(BLOCK_SIZE - off, left);
+		filp->f_pos += n;
+		left -= n;
+
 		if (bh) {
-			char * p = nr + bh->b_data;
-			while (chars-->0)
-				put_fs_byte(*(p++),buf++);
+			char *src = bh->b_data + off;
+			for (int i = 0; i < n; i++)
+				put_fs_byte(src[i], buf++);
 			brelse(bh);
 		} else {
-			while (chars-->0)
-				put_fs_byte(0,buf++);
+			for (int i = 0; i < n; i++)
+				put_fs_byte(0, buf++);
 		}
 	}
+
 	inode->i_atime = CURRENT_TIME;
-	return (count-left)?(count-left):-ERROR;
+	return (count - left) > 0 ? (count - left) : -ERROR;
 }
 
-int file_write(struct m_inode * inode, struct file * filp, char * buf, int count)
-{
-	off_t pos;
-	int block,c;
-	struct buffer_head * bh;
-	char * p;
-	int i=0;
 
-	if (filp->f_flags & O_APPEND)
-		pos = inode->i_size;
-	else
-		pos = filp->f_pos;
-	while (i<count) {
-		if (!(block = create_block(inode,pos/BLOCK_SIZE)))
+int file_write(struct m_inode *inode, struct file *filp, char *buf, int count)
+{
+	int written = 0;
+	int block, off, n;
+	struct buffer_head *bh;
+	char *dst;
+	off_t pos;
+
+	pos = (filp->f_flags & O_APPEND) ? inode->i_size : filp->f_pos;
+
+	while (written < count) {
+		block = create_block(inode, pos / BLOCK_SIZE);
+		if (!block)
 			break;
-		if (!(bh=bread(inode->i_dev,block)))
+
+		bh = bread(inode->i_dev, block);
+		if (!bh)
 			break;
-		c = pos % BLOCK_SIZE;
-		p = c + bh->b_data;
+
+		off = pos % BLOCK_SIZE;
+		dst = bh->b_data + off;
+		n = MIN(BLOCK_SIZE - off, count - written);
+
+		for (int i = 0; i < n; i++)
+			dst[i] = get_fs_byte(buf++);
+
 		bh->b_dirt = 1;
-		c = BLOCK_SIZE-c;
-		if (c > count-i) c = count-i;
-		pos += c;
+		brelse(bh);
+
+		pos += n;
+		written += n;
+
 		if (pos > inode->i_size) {
 			inode->i_size = pos;
 			inode->i_dirt = 1;
 		}
-		i += c;
-		while (c-->0)
-			*(p++) = get_fs_byte(buf++);
-		brelse(bh);
 	}
+
 	inode->i_mtime = CURRENT_TIME;
+
 	if (!(filp->f_flags & O_APPEND)) {
 		filp->f_pos = pos;
 		inode->i_ctime = CURRENT_TIME;
 	}
-	return (i?i:-1);
+
+	return written > 0 ? written : -1;
 }

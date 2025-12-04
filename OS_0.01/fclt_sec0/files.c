@@ -1,97 +1,166 @@
-/* Updated!! */
-#include <errno.h>
-#include <fcntl.h>
-
-#include <linux/sched.h>
+#include <linux/fs.h>
+#include <linux/buffer_head.h>
+#include <linux/uaccess.h>
+#include <linux/time.h>
+#include <linux/errno.h>
 #include <linux/kernel.h>
-#include <asm/segment.h>
+#include <linux/types.h>
+#include <linux/slab.h>
 
-#define MIN(a,b) ((a)<(b)?(a):(b))
+#define BLOCK_SIZE    1024  
+#define BLOCK_SHIFT   10    
 
-int file_read(struct m_inode *inode, struct file *filp, char *buf, int count)
+static inline unsigned long block_nr_from_pos(loff_t pos)
 {
-	int left = count;
-	int block, off, n;
-	struct buffer_head *bh;
-
-	if (count <= 0)
-		return 0;
-
-	while (left > 0) {
-		block = bmap(inode, filp->f_pos / BLOCK_SIZE);
-		if (block > 0) {
-			bh = bread(inode->i_dev, block);
-			if (!bh)
-				break;
-		} else {
-			bh = NULL;
-		}
-
-		off = filp->f_pos % BLOCK_SIZE;
-		n = MIN(BLOCK_SIZE - off, left);
-		filp->f_pos += n;
-		left -= n;
-
-		if (bh) {
-			char *src = bh->b_data + off;
-			for (int i = 0; i < n; i++)
-				put_fs_byte(src[i], buf++);
-			brelse(bh);
-		} else {
-			for (int i = 0; i < n; i++)
-				put_fs_byte(0, buf++);
-		}
-	}
-
-	inode->i_atime = CURRENT_TIME;
-	return (count - left) > 0 ? (count - left) : -ERROR;
+    return pos >> BLOCK_SHIFT;
 }
 
-
-int file_write(struct m_inode *inode, struct file *filp, char *buf, int count)
+ssize_t file_read(struct inode *inode, struct file *filp,
+                  char __user *buf, size_t count)
 {
-	int written = 0;
-	int block, off, n;
-	struct buffer_head *bh;
-	char *dst;
-	off_t pos;
+    loff_t pos = filp->f_pos;
+    size_t left = count;
+    ssize_t total = 0;
 
-	pos = (filp->f_flags & O_APPEND) ? inode->i_size : filp->f_pos;
+    if (count == 0)
+        return 0;
 
-	while (written < count) {
-		block = create_block(inode, pos / BLOCK_SIZE);
-		if (!block)
-			break;
+    inode_lock(inode);
 
-		bh = bread(inode->i_dev, block);
-		if (!bh)
-			break;
+    while (left > 0) {
+        unsigned long block = bmap(inode, block_nr_from_pos(pos));
+        size_t off = pos & (BLOCK_SIZE - 1);
+        size_t n = min(left, (size_t)(BLOCK_SIZE - off));
+        struct buffer_head *bh;
 
-		off = pos % BLOCK_SIZE;
-		dst = bh->b_data + off;
-		n = MIN(BLOCK_SIZE - off, count - written);
+        if (block > 0) {
+            bh = sb_bread(inode->i_sb, block);
+            if (!bh) {
+                /* I/O error while reading block */
+                total = -EIO;
+                break;
+            }
+        } else {
+            bh = NULL;
+        }
 
-		for (int i = 0; i < n; i++)
-			dst[i] = get_fs_byte(buf++);
+        /* If beyond EOF, return what we've read so far */
+        if (pos >= i_size_read(inode)) {
+            if (bh)
+                brelse(bh);
+            break;
+        }
 
-		bh->b_dirt = 1;
-		brelse(bh);
+        /* Trim to EOF if necessary */
+        if (pos + n > i_size_read(inode))
+            n = i_size_read(inode) - pos;
 
-		pos += n;
-		written += n;
+        if (n == 0) {
+            if (bh)
+                brelse(bh);
+            break;
+        }
 
-		if (pos > inode->i_size) {
-			inode->i_size = pos;
-			inode->i_dirt = 1;
-		}
-	}
+        if (bh) {
+            void *kaddr = bh->b_data + off;
+            if (copy_to_user(buf + total, kaddr, n)) {
+                brelse(bh);
+                total = -EFAULT;
+                break;
+            }
+            brelse(bh);
+        } else {
+            /* a hole - return zeroes */
+            void *zero_buf = kzalloc(n, GFP_KERNEL);
+            if (!zero_buf) {
+                total = -ENOMEM;
+                break;
+            }
+            if (copy_to_user(buf + total, zero_buf, n)) {
+                kfree(zero_buf);
+                total = -EFAULT;
+                break;
+            }
+            kfree(zero_buf);
+        }
 
-	inode->i_mtime = CURRENT_TIME;
+        pos += n;
+        left -= n;
+        total += n;
+    }
 
-	if (!(filp->f_flags & O_APPEND)) {
-		filp->f_pos = pos;
-		inode->i_ctime = CURRENT_TIME;
-	}
+    filp->f_pos = pos;
 
-	return written > 0 ? written : -1;
+    inode->i_atime = current_time(inode);
+    mark_inode_dirty(inode);
+
+    inode_unlock(inode);
+
+    return (total > 0) ? total : total; /* total already holds error or bytes */
+}
+
+ssize_t file_write(struct inode *inode, struct file *filp,
+                   const char __user *buf, size_t count)
+{
+    loff_t pos;
+    size_t left = count;
+    ssize_t written = 0;
+
+    if (count == 0)
+        return 0;
+
+    inode_lock(inode);
+
+    pos = (filp->f_flags & O_APPEND) ? i_size_read(inode) : filp->f_pos;
+
+    while (left > 0) {
+        unsigned long block;
+        size_t off = pos & (BLOCK_SIZE - 1);
+        size_t n = min(left, (size_t)(BLOCK_SIZE - off));
+        struct buffer_head *bh;
+
+        block = create_block(inode, block_nr_from_pos(pos));
+        if (!block) {
+            written = -ENOSPC;
+            break;
+        }
+
+        bh = sb_bread(inode->i_sb, block);
+        if (!bh) {
+            written = -EIO;
+            break;
+        }
+
+        /* Copy user data directly into the buffer head */
+        if (copy_from_user(bh->b_data + off, buf + written, n)) {
+            brelse(bh);
+            written = -EFAULT;
+            break;
+        }
+
+        mark_buffer_dirty(bh);
+        brelse(bh);
+
+        pos += n;
+        left -= n;
+        written += n;
+
+        /* update inode size if we extended the file */
+        if (pos > i_size_read(inode)) {
+            i_size_write(inode, pos);
+            mark_inode_dirty(inode);
+        }
+    }
+
+    inode->i_mtime = current_time(inode);
+
+    if (!(filp->f_flags & O_APPEND)) {
+        filp->f_pos = pos;
+        inode->i_ctime = current_time(inode);
+        mark_inode_dirty(inode);
+    }
+
+    inode_unlock(inode);
+
+    return (written >= 0) ? written : written; /* return bytes written or error */
 }

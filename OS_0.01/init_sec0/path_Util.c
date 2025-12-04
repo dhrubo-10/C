@@ -236,98 +236,117 @@ static bool __init_or_module initcall_blacklisted(initcall_t fn)
 		initrd_start = 0;
 	}
 #endif
-	static void __init initramfs_test_fname_overrun(struct kunit *test)
+
+static void __init initramfs_test_fname_overrun(struct kunit *test)
 {
 	char *err, *cpio_srcbuf;
 	size_t len, suffix_off;
-	struct initramfs_test_cpio c[] = { {
-		.magic = "070701",
-		.ino = 1,
-		.mode = S_IFREG | 0777,
-		.uid = 0,
-		.gid = 0,
-		.nlink = 1,
-		.mtime = 1,
-		.filesize = 0,
-		.devmajor = 0,
-		.devminor = 1,
-		.rdevmajor = 0,
-		.rdevminor = 0,
-		.namesize = sizeof("initramfs_test_fname_overrun"),
-		.csum = 0,
-		.fname = "initramfs_test_fname_overrun",
-	} };
+	struct initramfs_test_cpio c[] = {{
+		.magic      = "070701",
+		.ino        = 1,
+		.mode       = S_IFREG | 0777,
+		.uid        = 0,
+		.gid        = 0,
+		.nlink      = 1,
+		.mtime      = 1,
+		.filesize   = 0,
+		.devmajor   = 0,
+		.devminor   = 1,
+		.rdevmajor  = 0,
+		.rdevminor  = 0,
+		.namesize   = sizeof("initramfs_test_fname_overrun"),
+		.csum       = 0,
+		.fname      = "initramfs_test_fname_overrun",
+	}};
 
-	
-	
-	cpio_srcbuf = kmalloc(CPIO_HDRLEN + PATH_MAX + 3, GFP_KERNEL);
-	memset(cpio_srcbuf, 'B', CPIO_HDRLEN + PATH_MAX + 3);
-	/* limit overrun to avoid crashes / filp_open() ENAMETOOLONG */
+	/* Allocate large enough buffer with safety margin */
+	cpio_srcbuf = kmalloc(CPIO_HDRLEN + PATH_MAX + 64, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cpio_srcbuf);
+
+	memset(cpio_srcbuf, 'B', CPIO_HDRLEN + PATH_MAX + 64);
+
+	/* Avoid ENAMETOOLONG & guarantee termination */
 	cpio_srcbuf[CPIO_HDRLEN + strlen(c[0].fname) + 20] = '\0';
 
+	/* Construct minimal CPIO unit */
 	len = fill_cpio(c, ARRAY_SIZE(c), cpio_srcbuf);
-	/* overwrite trailing fname terminator and padding */
+	KUNIT_ASSERT_GT(test, len, 0);
+
+	/*
+	 * Smear out trailing '\0' bytes to simulate filename overrun corruption.
+	 * Ensure we do not run out of bounds.
+	 */
 	suffix_off = len - 1;
-	while (cpio_srcbuf[suffix_off] == '\0') {
+
+	while (suffix_off > CPIO_HDRLEN && cpio_srcbuf[suffix_off] == '\0') {
 		cpio_srcbuf[suffix_off] = 'P';
 		suffix_off--;
 	}
 
+	/* Expected: unpack_to_rootfs() should detect malformed fname and fail */
 	err = unpack_to_rootfs(cpio_srcbuf, len);
 	KUNIT_EXPECT_NOT_NULL(test, err);
 
 	kfree(cpio_srcbuf);
 }
 
+
 static void __init initramfs_test_data(struct kunit *test)
 {
 	char *err, *cpio_srcbuf;
 	size_t len;
 	struct file *file;
-	struct initramfs_test_cpio c[] = { {
-		.magic = "070701",
-		.ino = 1,
-		.mode = S_IFREG | 0777,
-		.uid = 0,
-		.gid = 0,
-		.nlink = 1,
-		.mtime = 1,
-		.filesize = sizeof("ASDF") - 1,
-		.devmajor = 0,
-		.devminor = 1,
-		.rdevmajor = 0,
-		.rdevminor = 0,
-		.namesize = sizeof("initramfs_test_data"),
-		.csum = 0,
-		.fname = "initramfs_test_data",
-		.data = "ASDF",
-	} };
+	struct initramfs_test_cpio c[] = {{
+		.magic      = "070701",
+		.ino        = 1,
+		.mode       = S_IFREG | 0777,
+		.uid        = 0,
+		.gid        = 0,
+		.nlink      = 1,
+		.mtime      = 1,
+		.filesize   = sizeof("ASDF") - 1,
+		.devmajor   = 0,
+		.devminor   = 1,
+		.rdevmajor  = 0,
+		.rdevminor  = 0,
+		.namesize   = sizeof("initramfs_test_data"),
+		.csum       = 0,
+		.fname      = "initramfs_test_data",
+		.data       = "ASDF",
+	}};
 
-	/* +6 for max name and data 4-byte padding */
-	cpio_srcbuf = kmalloc(CPIO_HDRLEN + c[0].namesize + c[0].filesize + 6,
+	/* +8 padding for header + name + data alignment */
+	cpio_srcbuf = kmalloc(CPIO_HDRLEN + c[0].namesize + c[0].filesize + 8,
 			      GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cpio_srcbuf);
 
 	len = fill_cpio(c, ARRAY_SIZE(c), cpio_srcbuf);
+	KUNIT_ASSERT_GT(test, len, 0);
 
 	err = unpack_to_rootfs(cpio_srcbuf, len);
 	KUNIT_EXPECT_NULL(test, err);
 
+	/* Verify correct file creation */
 	file = filp_open(c[0].fname, O_RDONLY, 0);
 	if (IS_ERR(file)) {
-		KUNIT_FAIL(test, "open failed");
+		KUNIT_FAIL(test, "Could not open created file");
 		goto out;
 	}
 
-	/* read back file contents into @cpio_srcbuf and confirm match */
+	/* Read back into buffer and verify content integrity */
 	len = kernel_read(file, cpio_srcbuf, c[0].filesize, NULL);
 	KUNIT_EXPECT_EQ(test, len, c[0].filesize);
 	KUNIT_EXPECT_MEMEQ(test, cpio_srcbuf, c[0].data, len);
 
 	fput(file);
+
+	/* Validate deletion works correctly */
 	KUNIT_EXPECT_EQ(test, init_unlink(c[0].fname), 0);
+
 out:
 	kfree(cpio_srcbuf);
 }
+
 
 #ifdef CONFIG_CRASH_DUMP
 static void __init setup_zfcpdump(void)

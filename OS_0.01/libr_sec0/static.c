@@ -15,13 +15,20 @@ static LIST_HEAD(relay_channels);
 
 static vm_fault_t relay_buf_fault(struct vm_fault *vmf)
 {
+	struct rchan_buf *buf;
 	struct page *page;
-	struct rchan_buf *buf = vmf->vma->vm_private_data;
-	pgoff_t pgoff = vmf->pgoff;
+	pgoff_t pgoff;
 
-	if (unlikely(!buf))
+	if (unlikely(!vmf || !vmf->vma))
+		return VM_FAULT_SIGBUS;
+
+	buf = vmf->vma->vm_private_data;
+	if (unlikely(!buf || !buf->start))
 		return VM_FAULT_OOM;
 
+	pgoff = vmf->pgoff;
+
+	/* Convert vmalloc region page offset to actual struct page */
 	page = vmalloc_to_page(buf->start + (pgoff << PAGE_SHIFT));
 	if (unlikely(!page))
 		return VM_FAULT_SIGBUS;
@@ -29,81 +36,115 @@ static vm_fault_t relay_buf_fault(struct vm_fault *vmf)
 	get_page(page);
 	vmf->page = page;
 
-	return 0;
+	return VM_FAULT_NOPAGE;
 }
-
 static void *relay_alloc_buf(struct rchan_buf *buf, size_t *size)
 {
-	void *mem = NULL;
 	unsigned int i, n_pages;
 
-	/* round up to page */
+	if (unlikely(!buf || !size))
+		return NULL;
+
+	/* enforce page alignment */
 	*size = PAGE_ALIGN(*size);
 	n_pages = *size >> PAGE_SHIFT;
 
+	if (!n_pages)
+		return NULL;
+
+	/* Allocate pointer array for pages */
 	buf->page_array = relay_alloc_page_array(n_pages);
 	if (!buf->page_array)
 		return NULL;
 
+	/* Allocate pages individually */
 	for (i = 0; i < n_pages; i++) {
 		struct page *p = alloc_page(GFP_KERNEL | __GFP_ZERO);
+
 		if (unlikely(!p)) {
-			/* de-populate pages allocated so far */
 			unsigned int j;
-			for (j = 0; j < i; j++) {
+
+			/* Free already allocated pages */
+			for (j = 0; j < i; j++)
 				__free_page(buf->page_array[j]);
-			}
+
 			relay_free_page_array(buf->page_array);
 			buf->page_array = NULL;
 			return NULL;
 		}
+
 		buf->page_array[i] = p;
 		set_page_private(p, (unsigned long)buf);
 	}
 
-	/* map pages into kernel virtual space */
-	mem = vmap(buf->page_array, n_pages, VM_MAP, PAGE_KERNEL);
-	if (unlikely(!mem)) {
-		/* cleanup allocated pages */
-		for (i = 0; i < n_pages; i++)
-			__free_page(buf->page_array[i]);
-		relay_free_page_array(buf->page_array);
-		buf->page_array = NULL;
-		return NULL;
-	}
-
+	/* Map all pages to a contiguous virtual region */
 	buf->page_count = n_pages;
-	return mem;
+
+	{
+		void *mem = vmap(buf->page_array,
+				 buf->page_count,
+				 VM_MAP,
+				 PAGE_KERNEL);
+
+		if (unlikely(!mem)) {
+			unsigned int j;
+
+			for (j = 0; j < buf->page_count; j++)
+				__free_page(buf->page_array[j]);
+
+			relay_free_page_array(buf->page_array);
+			buf->page_array = NULL;
+			buf->page_count = 0;
+			return NULL;
+		}
+
+		return mem;
+	}
 }
+
+
 
 static struct rchan_buf *relay_create_buf(struct rchan *chan)
 {
 	struct rchan_buf *buf;
 
-	if (chan->n_subbufs > KMALLOC_MAX_SIZE / sizeof(size_t))
+	if (unlikely(!chan))
 		return NULL;
 
-	buf = kzalloc(sizeof(struct rchan_buf), GFP_KERNEL);
+	/* Avoid integer overflow: n_subbufs * sizeof(size_t) */
+	if (chan->n_subbufs >
+	    KMALLOC_MAX_SIZE / sizeof(size_t))
+		return NULL;
+
+	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
 		return NULL;
-	buf->padding = kmalloc_array(chan->n_subbufs, sizeof(size_t),
-				     GFP_KERNEL);
-	if (!buf->padding)
-		goto free_buf;
 
+	/* Allocate per-subbuffer padding bookkeeping */
+	buf->padding = kcalloc(chan->n_subbufs,
+			       sizeof(size_t),
+			       GFP_KERNEL);
+	if (!buf->padding)
+		goto fail_buf;
+
+	/* Allocate the actual relay buffer memory */
 	buf->start = relay_alloc_buf(buf, &chan->alloc_size);
 	if (!buf->start)
-		goto free_buf;
+		goto fail_padding;
 
 	buf->chan = chan;
-	kref_get(&buf->chan->kref);
+	kref_get(&chan->kref);
+
 	return buf;
 
-free_buf:
+fail_padding:
 	kfree(buf->padding);
+
+fail_buf:
 	kfree(buf);
 	return NULL;
 }
+
 
 static void __relay_reset(struct rchan_buf *buf, unsigned int init)
 {

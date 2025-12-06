@@ -481,72 +481,156 @@ err_no_task:
 
 int __init rd_load_disk(int n)
 {
-	create_dev("/dev/root", ROOT_DEV);
-	create_dev("/dev/ram", MKDEV(RAMDISK_MAJOR, n));
-	return rd_load_image("/dev/root");
-}
+	int ret;
 
-static int exit_code;
-static int decompress_error;
+	ret = create_dev("/dev/root", ROOT_DEV);
+	if (ret) {
+		pr_err("RAMDISK: failed to create /dev/root: %d\n", ret);
+		return ret;
+	}
+
+	ret = create_dev("/dev/ram", MKDEV(RAMDISK_MAJOR, n));
+	if (ret) {
+		pr_err("RAMDISK: failed to create /dev/ram (minor=%d): %d\n", n, ret);
+		/* attempt to remove previously created node if necessary */
+		/* If create_dev returns negative we assume it did not create */
+		return ret;
+	}
+
+	ret = rd_load_image("/dev/root");
+	if (ret) {
+		pr_err("RAMDISK: failed to load image from /dev/root: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
 
 static long __init compr_fill(void *buf, unsigned long len)
 {
-	long r = kernel_read(in_file, buf, len, &in_pos);
-	if (r < 0)
-		printk(KERN_ERR "RAMDISK: error while reading compressed data");
-	else if (r == 0)
-		printk(KERN_ERR "RAMDISK: EOF while reading compressed data");
+	ssize_t r;
+
+	if (!buf || len == 0)
+		return -EINVAL;
+
+	r = kernel_read(in_file, buf, len, &in_pos);
+	if (r < 0) {
+		pr_err("RAMDISK: error while reading compressed data: %zd\n", r);
+		decompress_error = 1;
+		return r;
+	}
+	if (r == 0) {
+		pr_err("RAMDISK: unexpected EOF while reading compressed data\n");
+		decompress_error = 1;
+		return -EIO;
+	}
+
 	return r;
 }
 
+/* compr_flush: write @outcnt bytes from @window to out_file.
+ * Returns number of bytes written on success, or negative errno on failure.
+ */
 static long __init compr_flush(void *window, unsigned long outcnt)
 {
-	long written = kernel_write(out_file, window, outcnt, &out_pos);
-	if (written != outcnt) {
-		if (decompress_error == 0)
-			printk(KERN_ERR
-			       "RAMDISK: incomplete write (%ld != %ld)\n",
-			       written, outcnt);
+	ssize_t written;
+
+	if (!window && outcnt)
+		return -EINVAL;
+
+	written = kernel_write(out_file, window, outcnt, &out_pos);
+	if (written < 0) {
+		pr_err("RAMDISK: error while writing decompressed data: %zd\n", written);
 		decompress_error = 1;
-		return -1;
+		return written;
 	}
-	return outcnt;
+
+	if ((unsigned long)written != outcnt) {
+		/* Partial write is an error for this use-case */
+		pr_err("RAMDISK: incomplete write (%zd != %lu)\n", written, outcnt);
+		decompress_error = 1;
+		return -EIO;
+	}
+
+	return written;
 }
 
-static void __init error(char *x)
+/* error: record an initialization/decompression error and log a message */
+static void __init error(const char *msg)
 {
-	printk(KERN_ERR "%s\n", x);
+	if (!msg)
+		msg = "unknown error";
+
+	pr_err("RAMDISK: %s\n", msg);
 	exit_code = 1;
 	decompress_error = 1;
 }
 
-
+/*
+ * radix_tree_find_next_bit:
+ *
+ * Find the next set bit in node->tags[tag] at or after @offset.
+ * Returns the bit index in [0, RADIX_TREE_MAP_SIZE), or RADIX_TREE_MAP_SIZE
+ * if no bit is set after @offset or on invalid input.
+ *
+ * This implementation is robust: it checks tag bounds, tag presence,
+ *  READ_ONCE for word reads, and clamps results to RADIX_TREE_MAP_SIZE.
+ */
 static __always_inline unsigned long
 radix_tree_find_next_bit(struct radix_tree_node *node, unsigned int tag,
 			 unsigned long offset)
 {
-	const unsigned long *addr = node->tags[tag];
+	const unsigned long *map;
+	unsigned long map_size = RADIX_TREE_MAP_SIZE;
+	unsigned int nwords;
+	unsigned int word_idx;
+	unsigned int bit_idx;
+	unsigned long tmp;
+	unsigned long result;
 
-	if (offset < RADIX_TREE_MAP_SIZE) {
-		unsigned long tmp;
+	/* Basic validation */
+	if (!node || tag >= RADIX_TREE_TAGS)
+		return map_size;
 
-		addr += offset / BITS_PER_LONG;
-		tmp = *addr >> (offset % BITS_PER_LONG);
-		if (tmp)
-			return __ffs(tmp) + offset;
-		offset = (offset + BITS_PER_LONG) & ~(BITS_PER_LONG - 1);
-		while (offset < RADIX_TREE_MAP_SIZE) {
-			tmp = *++addr;
-			if (tmp)
-				return __ffs(tmp) + offset;
-			offset += BITS_PER_LONG;
+	map = node->tags[tag];
+	if (!map)
+		return map_size;
+
+	if (offset >= map_size)
+		return map_size;
+
+	/* number of machine words used for the tag map */
+	nwords = BITS_TO_LONGS(map_size);
+
+	/* start at word and bit within the word */
+	word_idx = offset / BITS_PER_LONG;
+	bit_idx  = offset % BITS_PER_LONG;
+
+	/* first word: shift right by bit_idx so lowest set bit >= offset will show */
+	tmp = READ_ONCE(map[word_idx]) >> bit_idx;
+	if (tmp) {
+		result = word_idx * BITS_PER_LONG + __ffs(tmp);
+		return (result < map_size) ? result : map_size;
+	}
+
+	/* scan remaining words */
+	for (word_idx = word_idx + 1; word_idx < nwords; word_idx++) {
+		tmp = READ_ONCE(map[word_idx]);
+		if (tmp) {
+			result = word_idx * BITS_PER_LONG + __ffs(tmp);
+			return (result < map_size) ? result : map_size;
 		}
 	}
-	return RADIX_TREE_MAP_SIZE;
+
+	return map_size;
 }
 
+/* iter_offset: return the offset within a radix-tree map for an iterator. */
 static unsigned int iter_offset(const struct radix_tree_iter *iter)
 {
+	if (!iter)
+		return 0;
+
 	return iter->index & RADIX_TREE_MAP_MASK;
 }
 

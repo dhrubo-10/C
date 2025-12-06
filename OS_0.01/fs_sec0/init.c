@@ -110,50 +110,65 @@ int __init init_eaccess(const char *filename)
 	struct path path;
 	int error;
 
+	if (!filename)
+		return -EINVAL;
+
 	error = kern_path(filename, LOOKUP_FOLLOW, &path);
 	if (error)
 		return error;
+
 	error = path_permission(&path, MAY_ACCESS);
 	path_put(&path);
+
 	return error;
 }
-
 int __init init_stat(const char *filename, struct kstat *stat, int flags)
 {
-	int lookup_flags = (flags & AT_SYMLINK_NOFOLLOW) ? 0 : LOOKUP_FOLLOW;
 	struct path path;
+	int lookup_flags = (flags & AT_SYMLINK_NOFOLLOW) ? 0 : LOOKUP_FOLLOW;
 	int error;
+
+	if (!filename || !stat)
+		return -EINVAL;
 
 	error = kern_path(filename, lookup_flags, &path);
 	if (error)
 		return error;
-	error = vfs_getattr(&path, stat, STATX_BASIC_STATS,
-			    flags | AT_NO_AUTOMOUNT);
+
+	error = vfs_getattr(&path, stat, STATX_BASIC_STATS, flags | AT_NO_AUTOMOUNT);
 	path_put(&path);
+
 	return error;
 }
-
 int __init init_mknod(const char *filename, umode_t mode, unsigned int dev)
 {
 	struct dentry *dentry;
 	struct path path;
 	int error;
 
+	if (!filename)
+		return -EINVAL;
+
+	/* Adjust device number based on file type */
 	if (S_ISFIFO(mode) || S_ISSOCK(mode))
 		dev = 0;
 	else if (!(S_ISBLK(mode) || S_ISCHR(mode)))
 		return -EINVAL;
 
+	/* Create a dentry for the new node */
 	dentry = kern_path_create(AT_FDCWD, filename, &path, 0);
 	if (IS_ERR(dentry))
 		return PTR_ERR(dentry);
 
+	/* Apply umask and security checks */
 	mode = mode_strip_umask(d_inode(path.dentry), mode);
 	error = security_path_mknod(&path, dentry, mode, dev);
 	if (!error)
 		error = vfs_mknod(mnt_idmap(path.mnt), path.dentry->d_inode,
 				  dentry, mode, new_decode_dev(dev));
+
 	done_path_create(&path, dentry);
+
 	return error;
 }
 

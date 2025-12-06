@@ -22,66 +22,103 @@ static struct single_step_data_t single_step_data;
 static unsigned long get_reg(int regno, struct pt_regs *regs, struct callee_regs *cregs);
 static void set_reg(int regno, unsigned long val, struct pt_regs *regs, struct callee_regs *cregs);
 
-static void to_gdb_regs(unsigned long *gdb_regs, struct pt_regs *kernel_regs,
-			struct callee_regs *cregs)
+static void to_gdb_regs(unsigned long *gdb_regs,
+			const struct pt_regs *regs,
+			const struct callee_regs *cregs)
 {
-	int regno;
+	int i;
 
-	for (regno = 0; regno <= 26 && regno + _R0 < GDB_MAX_REGS; regno++)
-		gdb_regs[_R0 + regno] = get_reg(regno, kernel_regs, cregs);
+	if (!gdb_regs || !regs)
+		return;
 
-	for (regno = 27; regno < GDB_MAX_REGS; regno++)
-		gdb_regs[regno] = 0;
+	/* R0–R26 general-purpose registers */
+	for (i = 0; i <= 26 && (_R0 + i) < GDB_MAX_REGS; i++)
+		gdb_regs[_R0 + i] = get_reg(i, regs, cregs);
 
-	gdb_regs[_FP]       = kernel_regs->fp;
-	gdb_regs[_SP]       = kernel_regs->sp;
-	gdb_regs[_BLINK]    = kernel_regs->blink;
-	gdb_regs[_RET]      = kernel_regs->ret;
-	gdb_regs[_STATUS32] = kernel_regs->status32;
-	gdb_regs[_LP_COUNT] = kernel_regs->lp_count;
-	gdb_regs[_LP_END]   = kernel_regs->lp_end;
-	gdb_regs[_LP_START] = kernel_regs->lp_start;
-	gdb_regs[_BTA]      = kernel_regs->bta;
-	gdb_regs[_STOP_PC]  = kernel_regs->ret;
+	/* Zero out remaining registers for safety/consistency */
+	for (; i < GDB_MAX_REGS; i++)
+		gdb_regs[i] = 0;
+
+	/* Architectural registers */
+	gdb_regs[_FP]       = regs->fp;
+	gdb_regs[_SP]       = regs->sp;
+	gdb_regs[_BLINK]    = regs->blink;
+	gdb_regs[_RET]      = regs->ret;
+	gdb_regs[_STATUS32] = regs->status32;
+	gdb_regs[_LP_COUNT] = regs->lp_count;
+	gdb_regs[_LP_END]   = regs->lp_end;
+	gdb_regs[_LP_START] = regs->lp_start;
+	gdb_regs[_BTA]      = regs->bta;
+
+	/* STOP_PC = return address */
+	gdb_regs[_STOP_PC]  = regs->ret;
 }
 
-static void from_gdb_regs(unsigned long *gdb_regs, struct pt_regs *kernel_regs,
+
+static void from_gdb_regs(const unsigned long *gdb_regs,
+			  struct pt_regs *regs,
 			  struct callee_regs *cregs)
 {
-	int regno;
+	int i;
 
-	for (regno = 0; regno <= 26 && regno + _R0 < GDB_MAX_REGS; regno++)
-		set_reg(regno, gdb_regs[_R0 + regno], kernel_regs, cregs);
+	if (!gdb_regs || !regs)
+		return;
 
-	kernel_regs->fp       = gdb_regs[_FP];
-	kernel_regs->sp       = gdb_regs[_SP];
-	kernel_regs->blink    = gdb_regs[_BLINK];
-	kernel_regs->ret      = gdb_regs[_RET];
-	kernel_regs->status32 = gdb_regs[_STATUS32];
-	kernel_regs->lp_count = gdb_regs[_LP_COUNT];
-	kernel_regs->lp_end   = gdb_regs[_LP_END];
-	kernel_regs->lp_start = gdb_regs[_LP_START];
-	kernel_regs->bta      = gdb_regs[_BTA];
+	/* Restore R0–R26 GPRs */
+	for (i = 0; i <= 26 && (_R0 + i) < GDB_MAX_REGS; i++)
+		set_reg(i, gdb_regs[_R0 + i], regs, cregs);
+
+	/* Restore architectural registers */
+	regs->fp       = gdb_regs[_FP];
+	regs->sp       = gdb_regs[_SP];
+	regs->blink    = gdb_regs[_BLINK];
+	regs->ret      = gdb_regs[_RET];
+	regs->status32 = gdb_regs[_STATUS32];
+	regs->lp_count = gdb_regs[_LP_COUNT];
+	regs->lp_end   = gdb_regs[_LP_END];
+	regs->lp_start = gdb_regs[_LP_START];
+	regs->bta      = gdb_regs[_BTA];
 }
 
-void pt_regs_to_gdb_regs(unsigned long *gdb_regs, struct pt_regs *kernel_regs)
+
+void pt_regs_to_gdb_regs(unsigned long *gdb_regs, struct pt_regs *regs)
 {
-	to_gdb_regs(gdb_regs, kernel_regs, (struct callee_regs *)current->thread.callee_reg);
+	struct callee_regs *cregs;
+
+	if (!current || !regs)
+		return;
+
+	cregs = (struct callee_regs *)current->thread.callee_reg;
+	to_gdb_regs(gdb_regs, regs, cregs);
 }
 EXPORT_SYMBOL(pt_regs_to_gdb_regs);
 
-void gdb_regs_to_pt_regs(unsigned long *gdb_regs, struct pt_regs *kernel_regs)
+
+void gdb_regs_to_pt_regs(const unsigned long *gdb_regs, struct pt_regs *regs)
 {
-	from_gdb_regs(gdb_regs, kernel_regs, (struct callee_regs *)current->thread.callee_reg);
+	struct callee_regs *cregs;
+
+	if (!current || !regs)
+		return;
+
+	cregs = (struct callee_regs *)current->thread.callee_reg;
+	from_gdb_regs(gdb_regs, regs, cregs);
 }
 EXPORT_SYMBOL(gdb_regs_to_pt_regs);
 
-void sleeping_thread_to_gdb_regs(unsigned long *gdb_regs, struct task_struct *task)
+
+void sleeping_thread_to_gdb_regs(unsigned long *gdb_regs,
+				 struct task_struct *task)
 {
-	if (task)
-		to_gdb_regs(gdb_regs, task_pt_regs(task), (struct callee_regs *)task->thread.callee_reg);
+	if (!task)
+		return;
+
+	to_gdb_regs(gdb_regs,
+		    task_pt_regs(task),
+		    (struct callee_regs *)task->thread.callee_reg);
 }
 EXPORT_SYMBOL(sleeping_thread_to_gdb_regs);
+
 
 static void undo_single_step(struct pt_regs *regs)
 {
